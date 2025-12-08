@@ -8,6 +8,9 @@
 #include <Wire.h>
 #include <SimpleKalmanFilter.h>  // Add SimpleKalmanFilter library
 
+#include "system_api.h"
+#include "control/control.h"
+
 // Add FreeRTOS includes
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -74,16 +77,7 @@ SimpleKalmanFilter kalmanX(1, 1, 0.01);  // SimpleKalmanFilter(e_mea, e_est, q)
 float gyroZoffset = 0.0f;           // Gyroscope Z-axis zero drift compensation
 unsigned long timer;                // Timer for calculating dt between readings
 
-// Sensor data structure with timestamp for control loops
-struct SensorData {
-  float yawAngle;        // Filtered yaw angle (degrees, -90 to 90)
-  float rawYaw;          // Raw integrated yaw (degrees, -180 to 180)
-  float gyroRate;        // Angular velocity (deg/s)
-  float dt;              // Time step (seconds)
-  unsigned long timestamp; // Microsecond timestamp
-  bool valid;            // Data validity flag
-};
-
+// Sensor snapshot used by MPU and control task (defined in include/system_api.h)
 SensorData currentSensorData = {0.0f, 0.0f, 0.0f, 0.0f, 0, false};
 
 // FreeRTOS synchronization
@@ -284,6 +278,21 @@ SensorData getSensorData() {
     xSemaphoreGive(angleMutex);
   }
   return data;
+}
+
+// Return the current servo angle (thread-safe)
+int getCurrentServoAngle() {
+  int angle = 0;
+  if (xSemaphoreTake(servoMutex, pdMS_TO_TICKS(10))) {
+    angle = currentServoAngle;
+    xSemaphoreGive(servoMutex);
+  }
+  return angle;
+}
+
+// MPU init state accessor
+bool mpuIsInitialized() {
+  return mpuInitialized;
 }
 
 // Read MPU6050 angle - returns mapped angle for web interface (0-180)
@@ -531,14 +540,59 @@ void processSerialCommand() {
       int angle = angleStr.toInt();
       
       if (angle >= 0 && angle <= 180) {
+        // Manual servo command: disable auto control to avoid conflict
+        if (controlIsEnabled()) {
+          controlEnable(false);
+          Serial.println("Auto-control disabled (manual override)");
+        }
         setServoAngle(angle);
         Serial.print("OK: Servo set to ");
         Serial.println(angle);
       } else {
         Serial.println("ERROR: Angle must be 0-180");
       }
+    } else if (command.length() > 0 && command.charAt(0) == 'c') {
+      // Enable/disable cascaded auto-control: c1=c ON, c0=c OFF, c toggle
+      if (command.length() == 1) {
+        bool cur = controlIsEnabled();
+        controlEnable(!cur);
+        Serial.print("Auto-control ");
+        Serial.println(!cur ? "enabled" : "disabled");
+      } else {
+        String arg = command.substring(1);
+        arg.trim();
+        if (arg == "1") { controlEnable(true); Serial.println("Auto-control enabled"); }
+        else if (arg == "0") { controlEnable(false); Serial.println("Auto-control disabled"); }
+        else { Serial.println("ERROR: Unknown argument for c. Use c0 or c1"); }
+      }
+    } else if (command.length() > 0 && command.charAt(0) == 't') {
+      // Set target yaw for auto control: t<deg> (e.g., t-30)
+      String angleStr = command.substring(1);
+      angleStr.trim();
+      float yaw = angleStr.toFloat();
+      if (yaw >= -360.0f && yaw <= 360.0f) {
+        // normalize
+        while (yaw > 180.0f) yaw -= 360.0f;
+        while (yaw < -180.0f) yaw += 360.0f;
+        controlSetTargetYaw(yaw);
+        Serial.print("OK: target yaw set to ");
+        Serial.println(yaw); 
+      } else {
+        Serial.println("ERROR: yaw out of range (-360..360)");
+      }
+    } else if (command.length() > 0 && command.charAt(0) == 'C') {
+      // Print control status (telemetry)
+      Serial.print("CTRL,");
+      Serial.print(controlIsEnabled() ? "ENABLED," : "DISABLED,");
+      Serial.print(controlGetTargetYaw(), 2);
+      Serial.print(",");
+      Serial.print(controlGetLastDesiredRate(), 2);
+      Serial.print(",");
+      Serial.print(controlGetLastRateCommand(), 2);
+      Serial.print(",servo:");
+      Serial.println(getCurrentServoAngle());
     } else if (command.length() > 0) {
-      Serial.println("ERROR: Unknown command. Use s<angle> (e.g., s90)");
+      Serial.println("ERROR: Unknown command. Use s<angle>, c<0|1>, t<yaw>, C for status");
     }
   }
 }
@@ -589,6 +643,9 @@ void setup() {
   } else {
     Serial.println("MPU6050 initialization failed - continuing without angle measurement");
   }
+
+  // Start the cascaded control task (separate component)
+  controlBegin();
   
 #if ENABLE_WIFI
   Serial.println("WiFi mode enabled");
@@ -640,6 +697,8 @@ void setup() {
   Serial.println("WiFi disabled - Serial-only mode");
   Serial.println("System ready for serial control");
   Serial.println("Commands: s<angle> (e.g., s90 to set servo to 90 degrees)");
+  Serial.println("  c0|c1 - disable/enable cascaded auto-control");
+  Serial.println("  t<angle> - set control target yaw (deg, -180..180)");
   turnLedOn(); // Solid LED in serial mode
 #endif
   
