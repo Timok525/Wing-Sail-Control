@@ -8,9 +8,6 @@
 #include <Wire.h>
 #include <SimpleKalmanFilter.h>  // Add SimpleKalmanFilter library
 
-#include "system_api.h"
-#include "control/control.h"
-
 // Add FreeRTOS includes
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -77,7 +74,16 @@ SimpleKalmanFilter kalmanX(1, 1, 0.01);  // SimpleKalmanFilter(e_mea, e_est, q)
 float gyroZoffset = 0.0f;           // Gyroscope Z-axis zero drift compensation
 unsigned long timer;                // Timer for calculating dt between readings
 
-// Sensor snapshot used by MPU and control task (defined in include/system_api.h)
+// Sensor data structure with timestamp for control loops
+struct SensorData {
+  float yawAngle;        // Filtered yaw angle (degrees, -90 to 90)
+  float rawYaw;          // Raw integrated yaw (degrees, -180 to 180)
+  float gyroRate;        // Angular velocity (deg/s)
+  float dt;              // Time step (seconds)
+  unsigned long timestamp; // Microsecond timestamp
+  bool valid;            // Data validity flag
+};
+
 SensorData currentSensorData = {0.0f, 0.0f, 0.0f, 0.0f, 0, false};
 
 // FreeRTOS synchronization
@@ -278,21 +284,6 @@ SensorData getSensorData() {
     xSemaphoreGive(angleMutex);
   }
   return data;
-}
-
-// Return the current servo angle (thread-safe)
-int getCurrentServoAngle() {
-  int angle = 0;
-  if (xSemaphoreTake(servoMutex, pdMS_TO_TICKS(10))) {
-    angle = currentServoAngle;
-    xSemaphoreGive(servoMutex);
-  }
-  return angle;
-}
-
-// MPU init state accessor
-bool mpuIsInitialized() {
-  return mpuInitialized;
 }
 
 // Read MPU6050 angle - returns mapped angle for web interface (0-180)
@@ -540,11 +531,6 @@ void processSerialCommand() {
       int angle = angleStr.toInt();
       
       if (angle >= 0 && angle <= 180) {
-        // Manual servo command: disable auto control to avoid conflict
-        if (controlIsEnabled()) {
-          controlEnable(false);
-          Serial.println("Auto-control disabled (manual override)");
-        }
         setServoAngle(angle);
         Serial.print("OK: Servo set to ");
         Serial.println(angle);
@@ -585,14 +571,14 @@ void processSerialCommand() {
       Serial.print("CTRL,");
       Serial.print(controlIsEnabled() ? "ENABLED," : "DISABLED,");
       Serial.print(controlGetTargetYaw(), 2);
-      Serial.print(",delta_raw(deg):");
-      Serial.print(controlGetLastDeltaRaw() * 180.0 / PI, 2);
-      Serial.print(",delta_filt(deg):");
-      Serial.print(controlGetLastDeltaFiltered() * 180.0 / PI, 2);
+      Serial.print(",");
+      Serial.print(controlGetLastDesiredRate(), 2);
+      Serial.print(",");
+      Serial.print(controlGetLastRateCommand(), 2);
       Serial.print(",servo:");
       Serial.println(getCurrentServoAngle());
     } else if (command.length() > 0) {
-      Serial.println("ERROR: Unknown command. Use s<angle>, c<0|1>, t<yaw>, C for status");
+      Serial.println("ERROR: Unknown command. Use s<angle> (e.g., s90)");
     }
   }
 }
@@ -643,9 +629,6 @@ void setup() {
   } else {
     Serial.println("MPU6050 initialization failed - continuing without angle measurement");
   }
-
-  // Start the cascaded control task (separate component)
-  controlBegin();
   
 #if ENABLE_WIFI
   Serial.println("WiFi mode enabled");
@@ -697,8 +680,6 @@ void setup() {
   Serial.println("WiFi disabled - Serial-only mode");
   Serial.println("System ready for serial control");
   Serial.println("Commands: s<angle> (e.g., s90 to set servo to 90 degrees)");
-  Serial.println("  c0|c1 - disable/enable cascaded auto-control");
-  Serial.println("  t<angle> - set control target yaw (deg, -180..180)");
   turnLedOn(); // Solid LED in serial mode
 #endif
   
