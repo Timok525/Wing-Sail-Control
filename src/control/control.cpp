@@ -71,6 +71,26 @@ static float maxServoDeltaPerStep = 6.0f; // deg per loop
 // Diagnostics (exposed read-only)
 static volatile float lastDesiredRate = 0.0f;
 static volatile float lastRateCmd = 0.0f;
+// Debugging: enable periodic debug prints from controlTask
+static bool controlDebug = false;
+// If true, the sign of servo delta computed by the controller is inverted
+// before being applied to the servo. Useful if servo wiring or coordinate
+// frame causes the actuator to move in the opposite direction.
+// Default to inverted output so controller movement matches expected
+// coordinate frame (flip left/right). This can be toggled at runtime
+// with controlSetInvertOutput() or via serial command 'o'.
+// Default servo center and max offset (degrees)
+static const float servoCenter = 90.0f;
+// default to +/-25 degrees limit
+static float maxServoOffset = 25.0f;
+
+// If true, the sign of servo delta computed by the controller is inverted
+// before being applied to the servo. Useful if servo wiring or coordinate
+// frame causes the actuator to move in the opposite direction.
+// Default to inverted output so controller movement matches expected
+// coordinate frame (flip left/right). This can be toggled at runtime
+// with controlSetInvertOutput() or via serial command 'o'.
+static bool invertOutput = true;
 
 // Control task implementation
 static void controlTask(void *parameter) {
@@ -110,16 +130,52 @@ static void controlTask(void *parameter) {
     float servoDelta = ratePID.update(rateError, dt);
     if (servoDelta > maxServoDeltaPerStep) servoDelta = maxServoDeltaPerStep;
     if (servoDelta < -maxServoDeltaPerStep) servoDelta = -maxServoDeltaPerStep;
-    lastRateCmd = servoDelta;
+    // Apply inversion flag (if enabled) so telemetry reflects the intended command
+    if (invertOutput) servoDelta = -servoDelta;
+
+    // Compute intended next angle and clamp it to the allowed center +/- maxServoOffset
+    int current = getCurrentServoAngle();
+    float intendedNextAngle = (float)current + servoDelta;
+    float minAngle = servoCenter - maxServoOffset;
+    float maxAngle = servoCenter + maxServoOffset;
+    float clampedNextAngle = intendedNextAngle;
+    if (clampedNextAngle < minAngle) clampedNextAngle = minAngle;
+    if (clampedNextAngle > maxAngle) clampedNextAngle = maxAngle;
+
+    // The actual applied delta (after clamping to the center limits) is what the actuator will move.
+    // Ensure we still respect per-loop max delta so we don't jump large distances when the
+    // current servo angle is outside the allowed window.
+    float appliedDelta = clampedNextAngle - (float)current;
+    if (appliedDelta > maxServoDeltaPerStep) appliedDelta = maxServoDeltaPerStep;
+    if (appliedDelta < -maxServoDeltaPerStep) appliedDelta = -maxServoDeltaPerStep;
+    lastRateCmd = appliedDelta;
 
     // Apply actuator change incrementally
-    int current = getCurrentServoAngle();
-    float nextAngleF = (float)current + servoDelta;
+    // compute nextAngleF from clampedNextAngle (already computed above)
+    float nextAngleF = (float)current + appliedDelta;
     if (nextAngleF < 0.0f) nextAngleF = 0.0f;
     if (nextAngleF > 180.0f) nextAngleF = 180.0f;
     int nextAngle = (int)roundf(nextAngleF);
 
     setServoAngle(nextAngle);
+
+    // debug printing (coalesced to every 10 loops -> ~200ms)
+    static int dbgCount = 0;
+    if (controlDebug) {
+      dbgCount++;
+      if (dbgCount >= 10) {
+        dbgCount = 0;
+        Serial.print("CTRL_LOOP,target:"); Serial.print(runningTarget, 2);
+        Serial.print(",yaw:"); Serial.print(data.yawAngle, 2);
+        Serial.print(",err:"); Serial.print(angleError, 2);
+        Serial.print(",dRate:"); Serial.print(desiredRate, 2);
+        Serial.print(",rateErr:"); Serial.print(rateError, 2);
+        Serial.print(",delta:"); Serial.print(appliedDelta, 2);
+        Serial.print(",limit:"); Serial.print(maxServoOffset, 2);
+        Serial.print(",inv:"); Serial.print(invertOutput ? "1" : "0");
+        Serial.print(",servo:"); Serial.println(current);
+      }
+    }
   }
 }
 
@@ -170,3 +226,52 @@ void controlSetRatePID(float kp, float ki, float kd)  { ratePID.setGains(kp, ki,
 
 float controlGetLastDesiredRate() { return lastDesiredRate; }
 float controlGetLastRateCommand()  { return lastRateCmd; }
+
+// Debug control loop printing
+void controlSetDebug(bool enable) {
+  if (ctrlMutex == NULL) ctrlMutex = xSemaphoreCreateMutex();
+  if (xSemaphoreTake(ctrlMutex, pdMS_TO_TICKS(10))) {
+    controlDebug = enable;
+    xSemaphoreGive(ctrlMutex);
+  }
+}
+
+void controlSetInvertOutput(bool inv) {
+  if (ctrlMutex == NULL) ctrlMutex = xSemaphoreCreateMutex();
+  if (xSemaphoreTake(ctrlMutex, pdMS_TO_TICKS(10))) {
+    invertOutput = inv;
+    xSemaphoreGive(ctrlMutex);
+  }
+}
+
+void controlSetMaxAngleOffset(float maxOffset) {
+  if (ctrlMutex == NULL) ctrlMutex = xSemaphoreCreateMutex();
+  if (xSemaphoreTake(ctrlMutex, pdMS_TO_TICKS(10))) {
+    if (maxOffset < 0.0f) maxOffset = 0.0f;
+    // clamp to reasonable upper bound
+    if (maxOffset > 90.0f) maxOffset = 90.0f;
+    maxServoOffset = maxOffset;
+    xSemaphoreGive(ctrlMutex);
+  }
+}
+
+float controlGetMaxAngleOffset() {
+  float v = 0.0f;
+  if (ctrlMutex == NULL) ctrlMutex = xSemaphoreCreateMutex();
+  if (xSemaphoreTake(ctrlMutex, pdMS_TO_TICKS(5))) { v = maxServoOffset; xSemaphoreGive(ctrlMutex); }
+  return v;
+}
+
+bool controlIsOutputInverted() {
+  bool v = false;
+  if (ctrlMutex == NULL) ctrlMutex = xSemaphoreCreateMutex();
+  if (xSemaphoreTake(ctrlMutex, pdMS_TO_TICKS(5))) { v = invertOutput; xSemaphoreGive(ctrlMutex); }
+  return v;
+}
+
+bool controlIsDebug() {
+  bool v = false;
+  if (ctrlMutex == NULL) ctrlMutex = xSemaphoreCreateMutex();
+  if (xSemaphoreTake(ctrlMutex, pdMS_TO_TICKS(5))) { v = controlDebug; xSemaphoreGive(ctrlMutex); }
+  return v;
+}

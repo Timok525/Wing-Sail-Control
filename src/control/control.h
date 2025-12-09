@@ -23,6 +23,21 @@ void controlSetRatePID(float kp, float ki, float kd);
 float controlGetLastDesiredRate();
 float controlGetLastRateCommand();
 
+// Debug control loop printing
+void controlSetDebug(bool enable);
+bool controlIsDebug();
+
+// Flip control->actuator sign (useful if servo wiring or coordinate frames
+// are reversed). When inverted is true, control-generated deltas will be
+// negated before being applied to the servo.
+void controlSetInvertOutput(bool invert);
+bool controlIsOutputInverted();
+
+// Limit the actuator angle relative to the center position (in degrees).
+// The controller will clamp its next angle to center +/- maxOffset. Default will be set in the .cpp
+void controlSetMaxAngleOffset(float maxOffset);
+float controlGetMaxAngleOffset();
+
 /* your algoiwefjsd */
 
 

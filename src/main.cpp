@@ -8,6 +8,8 @@
 #include <Wire.h>
 #include <SimpleKalmanFilter.h>  // Add SimpleKalmanFilter library
 
+#include "control/control.h"
+
 // Add FreeRTOS includes
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -74,16 +76,7 @@ SimpleKalmanFilter kalmanX(1, 1, 0.01);  // SimpleKalmanFilter(e_mea, e_est, q)
 float gyroZoffset = 0.0f;           // Gyroscope Z-axis zero drift compensation
 unsigned long timer;                // Timer for calculating dt between readings
 
-// Sensor data structure with timestamp for control loops
-struct SensorData {
-  float yawAngle;        // Filtered yaw angle (degrees, -90 to 90)
-  float rawYaw;          // Raw integrated yaw (degrees, -180 to 180)
-  float gyroRate;        // Angular velocity (deg/s)
-  float dt;              // Time step (seconds)
-  unsigned long timestamp; // Microsecond timestamp
-  bool valid;            // Data validity flag
-};
-
+// Sensor snapshot used by MPU and control task (defined in include/system_api.h)
 SensorData currentSensorData = {0.0f, 0.0f, 0.0f, 0.0f, 0, false};
 
 // FreeRTOS synchronization
@@ -525,7 +518,7 @@ void processSerialCommand() {
     String command = Serial.readStringUntil('\n');
     command.trim();
     
-    if (command.length() > 0 && command.charAt(0) == 's') {
+    if (command.length() > 0 && (command.charAt(0) == 's' || command.charAt(0) == 'S')) {
       // Extract angle from command (e.g., "s90" -> 90)
       String angleStr = command.substring(1);
       int angle = angleStr.toInt();
@@ -537,8 +530,102 @@ void processSerialCommand() {
       } else {
         Serial.println("ERROR: Angle must be 0-180");
       }
+    } else if (command.length() > 0 && (command.charAt(0) == 'c')) {
+      // Enable/disable cascaded auto-control: c1=c ON, c0=c OFF, c toggle
+      if (command.length() == 1) {
+        bool cur = controlIsEnabled();
+        controlEnable(!cur);
+        Serial.print("Auto-control ");
+        Serial.println(!cur ? "enabled" : "disabled");
+      } else {
+        String arg = command.substring(1);
+        arg.trim();
+        if (arg == "1") { controlEnable(true); Serial.println("Auto-control enabled"); }
+        else if (arg == "0") { controlEnable(false); Serial.println("Auto-control disabled"); }
+        else { Serial.println("ERROR: Unknown argument for c. Use c0 or c1"); }
+      }
+    } else if (command.length() > 0 && (command.charAt(0) == 't' || command.charAt(0) == 'T')) {
+      // Set target yaw for auto control: t<deg> (e.g., t-30)
+      String angleStr = command.substring(1);
+      angleStr.trim();
+      float yaw = angleStr.toFloat();
+      if (yaw >= -360.0f && yaw <= 360.0f) {
+        // normalize
+        while (yaw > 180.0f) yaw -= 360.0f;
+        while (yaw < -180.0f) yaw += 360.0f;
+        controlSetTargetYaw(yaw);
+        Serial.print("OK: target yaw set to ");
+        Serial.println(yaw);
+      } else {
+        Serial.println("ERROR: yaw out of range (-360..360)");
+      }
+    } else if (command.length() > 0 && (command.charAt(0) == 'C')) {
+      // Print control status (telemetry) — adapt for current controller API
+      Serial.print("CTRL,");
+      Serial.print(controlIsEnabled() ? "ENABLED," : "DISABLED,");
+      Serial.print(controlGetTargetYaw(), 2);
+      Serial.print(",desired_rate(deg/s):");
+      Serial.print(controlGetLastDesiredRate(), 2);
+      Serial.print(",rate_cmd(deg):");
+      Serial.print(controlGetLastRateCommand(), 2);
+      Serial.print(",limit:");
+      Serial.print(controlGetMaxAngleOffset(), 2);
+      Serial.print(",invert:");
+      Serial.print(controlIsOutputInverted() ? "1" : "0");
+      Serial.print(",servo:");
+      Serial.println(getCurrentServoAngle());
+    } else if (command.length() > 0 && (command.charAt(0) == 'd' || command.charAt(0) == 'D')) {
+      // Toggle or set control debug printing: d  -> toggle, d1 -> enable, d0 -> disable
+      String arg = command.substring(1);
+      arg.trim();
+      if (arg.length() == 0) {
+        bool cur = controlIsDebug();
+        controlSetDebug(!cur);
+        Serial.print("Control debug "); Serial.println(!cur ? "enabled" : "disabled");
+      } else if (arg == "1") {
+        controlSetDebug(true);
+        Serial.println("Control debug enabled");
+      } else if (arg == "0") {
+        controlSetDebug(false);
+        Serial.println("Control debug disabled");
+      } else {
+        Serial.println("ERROR: d usage: d (toggle) | d1 (on) | d0 (off)");
+      }
+    } else if (command.length() > 0 && (command.charAt(0) == 'o' || command.charAt(0) == 'O')) {
+      // Toggle or set inversion of control output: o  -> toggle, o1 -> enable, o0 -> disable
+      String arg = command.substring(1);
+      arg.trim();
+      if (arg.length() == 0) {
+        bool cur = controlIsOutputInverted();
+        controlSetInvertOutput(!cur);
+        Serial.print("Control invert "); Serial.println(!cur ? "enabled" : "disabled");
+      } else if (arg == "1") {
+        controlSetInvertOutput(true);
+        Serial.println("Control invert enabled");
+      } else if (arg == "0") {
+        controlSetInvertOutput(false);
+        Serial.println("Control invert disabled");
+      } else {
+        Serial.println("ERROR: o usage: o (toggle) | o1 (on) | o0 (off)");
+      }
+    } else if (command.length() > 0 && (command.charAt(0) == 'm' || command.charAt(0) == 'M')) {
+      // Set or query max angle offset: m -> print current, m25 -> set to 25 degrees
+      String arg = command.substring(1);
+      arg.trim();
+      if (arg.length() == 0) {
+        Serial.print("Current control max angle offset: ");
+        Serial.println(controlGetMaxAngleOffset(), 2);
+      } else {
+        float val = arg.toFloat();
+        if (val < 0.0f || val > 90.0f) {
+          Serial.println("ERROR: max offset must be 0..90 deg");
+        } else {
+          controlSetMaxAngleOffset(val);
+          Serial.print("OK: max angle offset set to "); Serial.println(val, 2);
+        }
+      }
     } else if (command.length() > 0) {
-      Serial.println("ERROR: Unknown command. Use s<angle> (e.g., s90)");
+      Serial.println("ERROR: Unknown command. Use s<angle>, c<0|1>, t<yaw>, C for status");
     }
   }
 }
@@ -581,6 +668,10 @@ void setup() {
   
   // Set servo to center position (90 degrees)
   setServoAngle(90);
+
+  // Start control task (cascaded PID) so auto-control actually runs
+  controlBegin();
+  Serial.println("Control task started");
   
   // Initialize MPU6050 sensor
   mpuInitialized = initMPU6050();
@@ -640,6 +731,12 @@ void setup() {
   Serial.println("WiFi disabled - Serial-only mode");
   Serial.println("System ready for serial control");
   Serial.println("Commands: s<angle> (e.g., s90 to set servo to 90 degrees)");
+  Serial.println("  c0|c1 or c - disable/enable auto-control");
+  Serial.println("  t<angle> - set target yaw (deg, -180..180)");
+  Serial.println("  C - show control status (target, desired_rate, rate_cmd)");
+  Serial.println("  o | o1 | o0 - toggle | enable | disable invert of control output (reverse direction)");
+  Serial.println("  m<deg> - set controller +/- angle limit in degrees (e.g. m25). No arg prints current limit.");
+  Serial.println("  d | d1 | d0 - toggle | enable | disable control debug prints");
   turnLedOn(); // Solid LED in serial mode
 #endif
   
@@ -689,4 +786,14 @@ void loop() {
   // Process serial commands in the main loop
   processSerialCommand();
   vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to prevent tight loop
+}
+
+// Return the current servo angle (thread-safe)
+int getCurrentServoAngle() {
+  int angle = 0;
+  if (xSemaphoreTake(servoMutex, pdMS_TO_TICKS(10))) {
+    angle = currentServoAngle;
+    xSemaphoreGive(servoMutex);
+  }
+  return angle;
 }
