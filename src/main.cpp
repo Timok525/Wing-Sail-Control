@@ -537,46 +537,6 @@ void processSerialCommand() {
       } else {
         Serial.println("ERROR: Angle must be 0-180");
       }
-    } else if (command.length() > 0 && command.charAt(0) == 'c') {
-      // Enable/disable cascaded auto-control: c1=c ON, c0=c OFF, c toggle
-      if (command.length() == 1) {
-        bool cur = controlIsEnabled();
-        controlEnable(!cur);
-        Serial.print("Auto-control ");
-        Serial.println(!cur ? "enabled" : "disabled");
-      } else {
-        String arg = command.substring(1);
-        arg.trim();
-        if (arg == "1") { controlEnable(true); Serial.println("Auto-control enabled"); }
-        else if (arg == "0") { controlEnable(false); Serial.println("Auto-control disabled"); }
-        else { Serial.println("ERROR: Unknown argument for c. Use c0 or c1"); }
-      }
-    } else if (command.length() > 0 && command.charAt(0) == 't') {
-      // Set target yaw for auto control: t<deg> (e.g., t-30)
-      String angleStr = command.substring(1);
-      angleStr.trim();
-      float yaw = angleStr.toFloat();
-      if (yaw >= -360.0f && yaw <= 360.0f) {
-        // normalize
-        while (yaw > 180.0f) yaw -= 360.0f;
-        while (yaw < -180.0f) yaw += 360.0f;
-        controlSetTargetYaw(yaw);
-        Serial.print("OK: target yaw set to ");
-        Serial.println(yaw); 
-      } else {
-        Serial.println("ERROR: yaw out of range (-360..360)");
-      }
-    } else if (command.length() > 0 && command.charAt(0) == 'C') {
-      // Print control status (telemetry)
-      Serial.print("CTRL,");
-      Serial.print(controlIsEnabled() ? "ENABLED," : "DISABLED,");
-      Serial.print(controlGetTargetYaw(), 2);
-      Serial.print(",");
-      Serial.print(controlGetLastDesiredRate(), 2);
-      Serial.print(",");
-      Serial.print(controlGetLastRateCommand(), 2);
-      Serial.print(",servo:");
-      Serial.println(getCurrentServoAngle());
     } else if (command.length() > 0) {
       Serial.println("ERROR: Unknown command. Use s<angle> (e.g., s90)");
     }
