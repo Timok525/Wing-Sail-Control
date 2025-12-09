@@ -585,10 +585,10 @@ void processSerialCommand() {
       Serial.print("CTRL,");
       Serial.print(controlIsEnabled() ? "ENABLED," : "DISABLED,");
       Serial.print(controlGetTargetYaw(), 2);
-      Serial.print(",");
-      Serial.print(controlGetLastDesiredRate(), 2);
-      Serial.print(",");
-      Serial.print(controlGetLastRateCommand(), 2);
+      Serial.print(",delta_raw(deg):");
+      Serial.print(controlGetLastDeltaRaw() * 180.0 / PI, 2);
+      Serial.print(",delta_filt(deg):");
+      Serial.print(controlGetLastDeltaFiltered() * 180.0 / PI, 2);
       Serial.print(",servo:");
       Serial.println(getCurrentServoAngle());
     } else if (command.length() > 0) {
