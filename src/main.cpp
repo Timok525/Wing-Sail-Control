@@ -77,7 +77,7 @@ float gyroZoffset = 0.0f;           // Gyroscope Z-axis zero drift compensation
 unsigned long timer;                // Timer for calculating dt between readings
 
 // Sensor snapshot used by MPU and control task (defined in include/system_api.h)
-SensorData currentSensorData = {0.0f, 0.0f, 0.0f, 0.0f, 0, false};
+SensorData currentSensorData = {0.0f, 0.0f, 0.0f, 0.0f, 0, false}; //0.0f表示直接初始化为浮点型0
 
 // FreeRTOS synchronization
 SemaphoreHandle_t angleMutex;   // Protects sensor data
@@ -195,9 +195,10 @@ bool initMPU6050() {
   // Configure accelerometer range (±2, 4, 8, or 16 G)
   mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
   // Configure gyroscope range (250, 500, 1000, or 2000 degrees/second)
-  mpu.setGyroRange(MPU6050_RANGE_1000_DEG);
+  // Lower range = higher sensitivity for small movements
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
   // Configure filter bandwidth (5, 10, 21, 44, 94, 184, 260 Hz)
-  mpu.setFilterBandwidth(MPU6050_BAND_44_HZ);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   
   vTaskDelay(pdMS_TO_TICKS(100));
   
@@ -220,6 +221,24 @@ bool initMPU6050() {
   return true;
 }
 
+// Global variables for IMU tracking
+static float rawYaw = 0.0f;
+static bool yawInitialized = false;
+static float gyroRateFiltered = 0.0f;
+
+// Reset IMU state to zero
+void resetIMU() {
+  if (xSemaphoreTake(angleMutex, portMAX_DELAY)) {
+    measuredAngle = 0.0f;
+    rawYaw = 0.0f;
+    yawInitialized = false; 
+    gyroRateFiltered = 0.0f;
+    kalmanX = SimpleKalmanFilter(1, 1, 0.01);
+    xSemaphoreGive(angleMutex);
+    Serial.println("IMU data reset to zero");
+  }
+}
+
 // Update sensor data with timestamp - called by MPU task
 void updateSensorData() {
   if (!mpuInitialized) {
@@ -240,16 +259,42 @@ void updateSensorData() {
       dt = 0.02f; // Assume nominal 50 Hz update if timing glitch occurs
     }
 
-    float gyroRateDeg = (g.gyro.z - gyroZoffset) * 180.0f / PI; // Convert rad/s to deg/s
+    // Convert rad/s to deg/s (bias compensated)
+    const float gyroRateDeg = (g.gyro.z - gyroZoffset) * 180.0f / PI;
 
-    static float rawYaw = 0.0f;
-    static bool yawInitialized = false;
+    // Light low-pass on gyro rate to reduce noise sensitivity in the rate loop
+    // tau=0.05s gives small delay but noticeably less jitter
+    const float tauRate = 0.05f;
+    const float alphaRate = dt / (tauRate + dt);
+    gyroRateFiltered += alphaRate * (gyroRateDeg - gyroRateFiltered);
+
+    // Online bias tracking (reduces yaw drift over time):
+    // When the system is near-stationary, slowly adapt gyroZoffset towards current reading.
+    // This helps compensate temperature drift and vibration-induced bias changes.
+    const int servoAngleSnapshot = currentServoAngle; // ok to read without mutex (int is atomic on ESP32)
+    const bool nearCenter = (abs(servoAngleSnapshot - 90) <= 3);
+    const bool nearStill = (fabsf(gyroRateFiltered) <= 0.5f);
+    if (nearCenter && nearStill) {
+      const float tauBias = 20.0f; // seconds (slow)
+      const float alphaBias = dt / (tauBias + dt);
+      gyroZoffset += alphaBias * (g.gyro.z - gyroZoffset); // gyroZoffset is in rad/s
+    }
+
     if (!yawInitialized) {
       rawYaw = measuredAngle;
       yawInitialized = true;
     }
 
-    rawYaw += gyroRateDeg * dt;
+    rawYaw += gyroRateFiltered * dt;
+
+    // Washout filter (High-pass behavior for Yaw):
+    // Slowly decay the yaw angle towards zero to prevent long-term drift accumulation.
+    // Since we don't have a compass, we can't hold absolute heading forever.
+    // This makes the system act like a "rate damper" that resists change but eventually accepts new headings as "zero".
+    // tau_washout = 10.0s means errors decay by ~63% in 10 seconds.
+    const float tauWashout = 10.0f; 
+    const float alphaWashout = dt / (tauWashout + dt);
+    rawYaw = rawYaw * (1.0f - alphaWashout);
 
     // Keep raw yaw within [-180, 180] to avoid overflow
     if (rawYaw > 180.0f) rawYaw -= 360.0f;
@@ -260,7 +305,7 @@ void updateSensorData() {
     // Update sensor data structure atomically
     currentSensorData.yawAngle = measuredAngle;
     currentSensorData.rawYaw = rawYaw;
-    currentSensorData.gyroRate = gyroRateDeg;
+    currentSensorData.gyroRate = gyroRateFiltered;
     currentSensorData.dt = dt;
     currentSensorData.timestamp = now;
     currentSensorData.valid = true;
@@ -671,15 +716,22 @@ void setup() {
 
   // Start control task (cascaded PID) so auto-control actually runs
   controlBegin();
+  controlEnable(true); // Enable auto-control by default
   Serial.println("Control task started");
   
   // Initialize MPU6050 sensor
   mpuInitialized = initMPU6050();
   if (mpuInitialized) {
     Serial.println("MPU6050 initialized successfully");
+    // Explicitly reset IMU data to zero
+    resetIMU();
   } else {
     Serial.println("MPU6050 initialization failed - continuing without angle measurement");
   }
+
+  // Explicitly reset control state (PIDs, target yaw)
+  controlReset();
+  Serial.println("System state reset: Servo centered, IMU zeroed, Control reset.");
   
 #if ENABLE_WIFI
   Serial.println("WiFi mode enabled");

@@ -8,7 +8,91 @@ static const TickType_t CONTROL_LOOP_MS = pdMS_TO_TICKS(20); // 50 Hz
 static const int CONTROL_TASK_STACK = 8192; // words/bytes depends on port, match project
 static const int CONTROL_TASK_PRIORITY = 2; // same as MPU task
 
-// PID controller with simple anti-windup
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// Parameter structure from controller_PID.cpp
+struct Params {
+    // Basic physical parameters
+    double x_OA = 0.1;    double y_OA = 0.0;    double z_OA = -1.0;
+    double x_OR = 1.0;    double y_OR = 0.0;    double z_OR = -0.7;
+    double z_OC = -0.3;   double C_SC = 1.8;    double C_RC = 0.8;
+    double S_S = 1.8;     double S_R = 0.6;     double m_T = 0.005;
+    double m_C = 1.2;     double g = 9.81;      double J_z = 0.09;
+    double l = 0.3;       double V_S = 2.5;     double p_s = 1.225;
+
+    // Phi threshold
+    double phi_thresh = 25.0 * M_PI / 180.0;
+    double coupling_min = 0.01;
+    double coupling_gain = 0.01;
+
+    // Limits
+    double alpha_max = 0.5;    double beta_max = 0.5;     double phi_max = 1.5;
+    double d_alpha_base = 0.08; 
+    double d_beta_base = 0.05; 
+    double d_phi_max = 0.2;
+    double bound_ratio = 0.4;
+
+    // Smoothing
+    double tau_smooth_alpha = 0.15; 
+    double tau_smooth_beta = 0.2;   
+
+    // PID Gains
+    double Kp_alpha = 0.18;  double Kd_alpha = 0.2;   double Ki_alpha = 0.07;  
+    double Kp_beta = 0.08;   double Kd_beta = 0.1;    double Ki_beta = 0.03;   
+    
+    // Phi Gains (Main Control)
+    double Kp_phi = 4.55;    double Kd_phi = 7.6;     double Ki_phi = 0.53;    
+
+    // Integral limits
+    double phi_int_max = 0.9;     double phi_int_thresh = 0.175;
+    double phi_error_dead = 0.035; double integral_max = 0.03;
+
+    // Output limits
+    double delta_max = 1.5;  double delta_soft = 1.2;
+
+    // Delay/Noise (Simulation only, unused here)
+    double tau_delta = 2.0;       double delta_noise_amp = 0.005;
+
+    // Target
+    double phi_target = 0.0;
+
+    // Damping
+    double alpha_damping_gain = 0.3;
+    double beta_damping_gain = 0.3;
+};
+
+static Params params;
+
+// Soft saturate function
+static double soft_saturate(double u, double max_u, double soft_u) {
+    if (max_u <= soft_u) {
+        soft_u = max_u * 0.7;
+    }
+    if (std::abs(u) <= soft_u) {
+        return u;
+    } else {
+        double k = (std::abs(u) - soft_u) / (max_u - soft_u);
+        k = std::tanh(k * 5.0);
+        return std::copysign(1.0, u) * (soft_u + k * (max_u - soft_u));
+    }
+}
+
+// Helper: shortest angular difference (target - current) -> [-180, 180]
+static float angleDiff(float target, float current) {
+  float d = target - current;
+  while (d > 180.0f) d -= 360.0f;
+  while (d < -180.0f) d += 360.0f;
+  return d;
+}
+
+// Internal control state
+static SemaphoreHandle_t ctrlMutex = NULL;
+static bool enabled = false;
+static float targetYaw = 0.0f;
+
+// PID controller class
 class PID {
 public:
   float kp, ki, kd;
@@ -32,6 +116,15 @@ public:
   float update(float error, float dt) {
     if (dt <= 0.0f) dt = 0.02f;
 
+    // Conditional integration (anti-windup + simulation logic)
+    // Only integrate if error is small or opposes current integral
+    bool allowIntegrate = true;
+    // Simple anti-windup: if output saturated, don't integrate same direction? 
+    // Here we use the simulation's logic:
+    // if (abs(error) > thresh && sign(error) == sign(integrator)) allow = false;
+    // We'll stick to standard clamping for simplicity in this class, 
+    // but the outer loop can manage the integrator reset if needed.
+    
     integrator += error * dt;
     if (integrator > intMax) integrator = intMax;
     if (integrator < intMin) integrator = intMin;
@@ -48,59 +141,46 @@ public:
   }
 };
 
-// Helper: shortest angular difference (target - current) -> [-180, 180]
-static float angleDiff(float target, float current) {
-  float d = target - current;
-  while (d > 180.0f) d -= 360.0f;
-  while (d < -180.0f) d += 360.0f;
-  return d;
-}
+// Cascaded PIDs
+// Outer Loop: Angle Error -> Desired Rate
+// Gains derived from Simulation: Kp_out = Kp_sim / Kd_sim = 4.55 / 7.6 = 0.6
+//                                Ki_out = Ki_sim / Kd_sim = 0.53 / 7.6 = 0.07
+static PID anglePID(0.6f, 0.07f, 0.0f, -120.0f, 120.0f, -20.0f, 20.0f); 
 
-// Internal control state
-static SemaphoreHandle_t ctrlMutex = NULL;
-static bool enabled = false;
-static float targetYaw = 0.0f;
+// Inner Loop: Rate Error -> Servo Angle (Absolute from center)
+// Gains derived from Simulation: Kp_in = Kd_sim = 7.6
+static PID ratePID(7.6f, 0.0f, 0.0f, -90.0f, 90.0f, -10.0f, 10.0f);
 
-// Defaults (tune to your mechanical system)
-static PID anglePID(2.0f, 0.05f, 0.02f, -360.0f, 360.0f, -1000.0f, 1000.0f);
-static PID ratePID(0.6f, 0.02f, 0.0f, -10.0f, 10.0f, -50.0f, 50.0f);
-
-static float maxDesiredRate = 120.0f;     // deg/s
-static float maxServoDeltaPerStep = 6.0f; // deg per loop
-
-// Diagnostics (exposed read-only)
+// Diagnostics
 static volatile float lastDesiredRate = 0.0f;
 static volatile float lastRateCmd = 0.0f;
-// Debugging: enable periodic debug prints from controlTask
-static bool controlDebug = false;
-// If true, the sign of servo delta computed by the controller is inverted
-// before being applied to the servo. Useful if servo wiring or coordinate
-// frame causes the actuator to move in the opposite direction.
-// Default to inverted output so controller movement matches expected
-// coordinate frame (flip left/right). This can be toggled at runtime
-// with controlSetInvertOutput() or via serial command 'o'.
-// Default servo center and max offset (degrees)
-static const float servoCenter = 90.0f;
-// default to +/-25 degrees limit
-static float maxServoOffset = 25.0f;
 
-// If true, the sign of servo delta computed by the controller is inverted
-// before being applied to the servo. Useful if servo wiring or coordinate
-// frame causes the actuator to move in the opposite direction.
-// Default to inverted output so controller movement matches expected
-// coordinate frame (flip left/right). This can be toggled at runtime
-// with controlSetInvertOutput() or via serial command 'o'.
-static bool invertOutput = true;
+static bool controlDebug = false;
+static const float servoCenter = 90.0f;
+static float maxServoOffset = 25.0f;
+static bool invertOutput = false;
 
 // Control task implementation
 static void controlTask(void *parameter) {
   TickType_t lastWake = xTaskGetTickCount();
 
+  // Update PID gains from Params struct (one-time init or dynamic?)
+  // Let's sync them here to ensure they match the struct if it changes
+  // 映射仿真参数到串级PID参数：
+  // 外环 P = Kp_sim / Kd_sim (将角度误差转换为期望角速度)
+  float k_outer_p = params.Kp_phi / params.Kd_phi;
+  // 外环 I = Ki_sim / Kd_sim (消除稳态误差)
+  float k_outer_i = params.Ki_phi / params.Kd_phi;
+  // 内环 P = Kd_sim (将角速度误差转换为舵偏角，提供阻尼)
+  // 速度环对噪声/扰动更敏感，默认将其响应适当降低一些（可根据实际再调）
+  float k_inner_p = params.Kd_phi * 0.6f;
+  
+  anglePID.setGains(k_outer_p, k_outer_i, 0.0f);
+  ratePID.setGains(k_inner_p, 0.0f, 0.0f);
+
   for (;;) {
-    // Sleep until next cycle
     vTaskDelayUntil(&lastWake, CONTROL_LOOP_MS);
 
-    // Read configuration under lock
     bool run = false;
     float runningTarget = 0.0f;
     if (xSemaphoreTake(ctrlMutex, pdMS_TO_TICKS(5))) {
@@ -109,71 +189,86 @@ static void controlTask(void *parameter) {
       xSemaphoreGive(ctrlMutex);
     }
 
-    if (!run) continue;
+    if (!run) {
+        anglePID.reset();
+        ratePID.reset();
+        continue;
+    }
 
-    // Get snapshot of sensors
     SensorData data = getSensorData();
-    if (!data.valid) continue; // skip if sensor not ready
+    if (!data.valid) continue;
 
     float dt = data.dt;
-    if (dt <= 0.0f || dt > 0.5f) dt = 0.02f; // protect against invalid dt
+    if (dt <= 0.0f || dt > 0.5f) dt = 0.02f;
 
-    // Outer loop -> desired rate (deg/s)
+    // --- Cascaded Control Structure (串级控制结构) ---
+
+    // 1. Outer Loop: Angle Control (外环：角度控制)
+    // Input: Angle Error (deg) -> 目标角度与当前角度的差值
+    // Output: Desired Rate (deg/s) -> 期望的旋转速度
     float angleError = angleDiff(runningTarget, data.yawAngle);
+    
+    // Deadband from params (死区控制：误差极小时忽略，防止舵机抖动)
+    if (std::abs(angleError * M_PI/180.0) < params.phi_error_dead) angleError = 0.0f;
+
     float desiredRate = anglePID.update(angleError, dt);
-    if (desiredRate > maxDesiredRate) desiredRate = maxDesiredRate;
-    if (desiredRate < -maxDesiredRate) desiredRate = -maxDesiredRate;
     lastDesiredRate = desiredRate;
 
-    // Inner loop -> servo delta (deg)
+    // 2. Inner Loop: Rate Control (内环：角速度控制)
+    // Input: Rate Error (deg/s) -> 期望速度与实际陀螺仪速度的差值
+    // Output: Servo Angle Offset (deg) -> 舵机偏转角度（绝对位置模式）
+    // Note: Simulation uses radians, but our PIDs here are tuned with the ratio, so units cancel out 
+    // as long as we are consistent. 
+    // However, params.Kp_phi is 4.55 (for radians). 
+    // If we input degrees, we need to be careful.
+    // Simulation: delta(rad) = 4.55 * err(rad). 
+    // Here: delta(deg) = 4.55 * err(deg) ? 
+    // Yes, if K is dimensionless or 1/s, linear scaling works.
+    // delta(deg) = delta(rad) * 180/pi = 4.55 * err(rad) * 180/pi = 4.55 * err(deg).
+    // So the gains are valid for degrees too.
+
     float rateError = desiredRate - data.gyroRate;
     float servoDelta = ratePID.update(rateError, dt);
-    if (servoDelta > maxServoDeltaPerStep) servoDelta = maxServoDeltaPerStep;
-    if (servoDelta < -maxServoDeltaPerStep) servoDelta = -maxServoDeltaPerStep;
-    // Apply inversion flag (if enabled) so telemetry reflects the intended command
+    
+    // Soft saturation (optional, using the helper)
+    // servoDelta = soft_saturate(servoDelta, params.delta_max * 180.0/M_PI, params.delta_soft * 180.0/M_PI);
+    
+    // --- Actuation Logic (执行器逻辑) ---
+
+    // Apply inversion (反向控制：如果舵机安装方向相反，取反输出)
     if (invertOutput) servoDelta = -servoDelta;
 
-    // Compute intended next angle and clamp it to the allowed center +/- maxServoOffset
-    int current = getCurrentServoAngle();
-    float intendedNextAngle = (float)current + servoDelta;
-    float minAngle = servoCenter - maxServoOffset;
-    float maxAngle = servoCenter + maxServoOffset;
-    float clampedNextAngle = intendedNextAngle;
-    if (clampedNextAngle < minAngle) clampedNextAngle = minAngle;
-    if (clampedNextAngle > maxAngle) clampedNextAngle = maxAngle;
+    // Apply user-defined limit (maxServoOffset) (输出限幅：保护机械结构)
+    if (servoDelta > maxServoOffset) servoDelta = maxServoOffset;
+    if (servoDelta < -maxServoOffset) servoDelta = -maxServoOffset;
 
-    // The actual applied delta (after clamping to the center limits) is what the actuator will move.
-    // Ensure we still respect per-loop max delta so we don't jump large distances when the
-    // current servo angle is outside the allowed window.
-    float appliedDelta = clampedNextAngle - (float)current;
-    if (appliedDelta > maxServoDeltaPerStep) appliedDelta = maxServoDeltaPerStep;
-    if (appliedDelta < -maxServoDeltaPerStep) appliedDelta = -maxServoDeltaPerStep;
-    lastRateCmd = appliedDelta;
+    // Calculate final servo angle (Absolute Position Mode) (计算最终舵机角度 - 绝对位置模式)
+    // Note: Original code used incremental (next = current + delta).
+    // This implementation uses absolute (next = center + delta) because
+    // the simulation model assumes a direct mapping from error to deflection.
+    // 绝对模式：舵偏角直接叠加在中位（90度）上，而不是累加在当前角度上。
+    // 这消除了积分漂移，并确保系统在无控制信号时自动回中。
+    int targetServoAngle = (int)roundf(servoCenter + servoDelta);
 
-    // Apply actuator change incrementally
-    // compute nextAngleF from clampedNextAngle (already computed above)
-    float nextAngleF = (float)current + appliedDelta;
-    if (nextAngleF < 0.0f) nextAngleF = 0.0f;
-    if (nextAngleF > 180.0f) nextAngleF = 180.0f;
-    int nextAngle = (int)roundf(nextAngleF);
+    // Clamp to hardware limits (硬件限幅：防止超出舵机物理行程 0-180)
+    if (targetServoAngle < 0) targetServoAngle = 0;
+    if (targetServoAngle > 180) targetServoAngle = 180;
 
-    setServoAngle(nextAngle);
+    setServoAngle(targetServoAngle);
+    lastRateCmd = servoDelta;
 
-    // debug printing (coalesced to every 10 loops -> ~200ms)
+    // Debug printing
     static int dbgCount = 0;
     if (controlDebug) {
       dbgCount++;
       if (dbgCount >= 10) {
         dbgCount = 0;
-        Serial.print("CTRL_LOOP,target:"); Serial.print(runningTarget, 2);
-        Serial.print(",yaw:"); Serial.print(data.yawAngle, 2);
-        Serial.print(",err:"); Serial.print(angleError, 2);
-        Serial.print(",dRate:"); Serial.print(desiredRate, 2);
-        Serial.print(",rateErr:"); Serial.print(rateError, 2);
-        Serial.print(",delta:"); Serial.print(appliedDelta, 2);
-        Serial.print(",limit:"); Serial.print(maxServoOffset, 2);
-        Serial.print(",inv:"); Serial.print(invertOutput ? "1" : "0");
-        Serial.print(",servo:"); Serial.println(current);
+        Serial.print("CTRL_CAS,tgt:"); Serial.print(runningTarget, 1);
+        Serial.print(",yaw:"); Serial.print(data.yawAngle, 1);
+        Serial.print(",err:"); Serial.print(angleError, 1);
+        Serial.print(",dRate:"); Serial.print(desiredRate, 1);
+        Serial.print(",rateErr:"); Serial.print(rateError, 1);
+        Serial.print(",out:"); Serial.println(servoDelta, 1);
       }
     }
   }
@@ -195,6 +290,16 @@ void controlEnable(bool e) {
       anglePID.reset();
       ratePID.reset();
     }
+    xSemaphoreGive(ctrlMutex);
+  }
+}
+
+void controlReset() {
+  if (ctrlMutex == NULL) ctrlMutex = xSemaphoreCreateMutex();
+  if (xSemaphoreTake(ctrlMutex, pdMS_TO_TICKS(10))) {
+    anglePID.reset();
+    ratePID.reset();
+    targetYaw = 0.0f;
     xSemaphoreGive(ctrlMutex);
   }
 }
@@ -221,8 +326,15 @@ float controlGetTargetYaw() {
   return y;
 }
 
-void controlSetAnglePID(float kp, float ki, float kd) { anglePID.setGains(kp, ki, kd); }
-void controlSetRatePID(float kp, float ki, float kd)  { ratePID.setGains(kp, ki, kd); }
+void controlSetAnglePID(float kp, float ki, float kd) { 
+    // Map to Phi PID
+    params.Kp_phi = kp;
+    params.Ki_phi = ki;
+    params.Kd_phi = kd;
+}
+void controlSetRatePID(float kp, float ki, float kd)  { 
+    // Unused in this architecture
+}
 
 float controlGetLastDesiredRate() { return lastDesiredRate; }
 float controlGetLastRateCommand()  { return lastRateCmd; }

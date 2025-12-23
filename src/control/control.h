@@ -11,6 +11,9 @@ void controlBegin();
 void controlEnable(bool enabled);
 bool controlIsEnabled();
 
+// Reset control state (PIDs, target yaw)
+void controlReset();
+
 // Set/get target yaw (degrees, -180..180)
 void controlSetTargetYaw(float yaw);
 float controlGetTargetYaw();
