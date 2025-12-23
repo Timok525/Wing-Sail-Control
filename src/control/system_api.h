@@ -9,6 +9,8 @@ typedef struct SensorData {
   float yawAngle;        // Filtered yaw angle (degrees, -180..180)
   float rawYaw;          // Raw integrated yaw (degrees, -180..180)
   float gyroRate;        // Angular velocity (deg/s)
+  float pitchAngle;      // Pitch angle (degrees) from accelerometer
+  float rollAngle;       // Roll angle (degrees) from accelerometer
   float dt;              // Time step (seconds)
   unsigned long timestamp; // Microsecond timestamp
   bool valid;            // Data validity flag

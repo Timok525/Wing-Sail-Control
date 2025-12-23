@@ -47,7 +47,8 @@ struct Params {
 
     // Integral limits
     double phi_int_max = 0.9;     double phi_int_thresh = 0.175;
-    double phi_error_dead = 0.035; double integral_max = 0.03;
+    // Deadband: Reduced to ~0.5 degrees to improve centering accuracy
+    double phi_error_dead = 0.008; // was 0.035 (2 deg)
 
     // Output limits
     double delta_max = 1.5;  double delta_soft = 1.2;
@@ -173,7 +174,7 @@ static void controlTask(void *parameter) {
   float k_outer_i = params.Ki_phi / params.Kd_phi;
   // 内环 P = Kd_sim (将角速度误差转换为舵偏角，提供阻尼)
   // 速度环对噪声/扰动更敏感，默认将其响应适当降低一些（可根据实际再调）
-  float k_inner_p = params.Kd_phi * 0.6f;
+  float k_inner_p = params.Kd_phi * 0.6f;// 60% 增益以减少抖动
   
   anglePID.setGains(k_outer_p, k_outer_i, 0.0f);
   ratePID.setGains(k_inner_p, 0.0f, 0.0f);
@@ -235,6 +236,30 @@ static void controlTask(void *parameter) {
     
     // --- Actuation Logic (执行器逻辑) ---
 
+    // --- Feedforward Compensation from Pitch/Roll (倾角补偿) ---
+    // 目标：如果帆翼发生倾斜（Pitch/Roll），说明物理上已经偏离平衡位置。
+    // 即使 Yaw 积分误差为 0，我们也希望产生一定的恢复力矩。
+    // 策略：将 Pitch/Roll 角度作为额外的前馈项叠加到舵机输出上。
+    // 系数 K_tilt 需要根据实验调整，正负号取决于倾斜方向与期望恢复力矩的关系。
+    
+    // 假设：向左倾斜（Roll < 0）需要向右打舵来恢复（或反之，取决于气动特性）。
+    // 这里简单实现为线性叠加： servo_offset += K_roll * roll + K_pitch * pitch
+    
+    float tiltCompensation = 0.0f;
+    // 仅当倾角超过一定阈值（如 3 度）时才介入，避免噪声干扰
+    if (abs(data.rollAngle) > 3.0f) {
+        // 示例系数：每倾斜 0.5 度，舵机额外偏转 1.0 度
+        // 请根据实际方向调整正负号！
+        tiltCompensation += 2.0f * data.rollAngle; 
+    }
+    // Pitch 补偿同理（如果需要）
+    // if (abs(data.pitchAngle) > 5.0f) {
+    //    tiltCompensation += 0.3f * data.pitchAngle;
+    // }
+
+    // 将补偿量叠加到 PID 输出上
+    servoDelta += tiltCompensation;
+
     // Apply inversion (反向控制：如果舵机安装方向相反，取反输出)
     if (invertOutput) servoDelta = -servoDelta;
 
@@ -265,9 +290,8 @@ static void controlTask(void *parameter) {
         dbgCount = 0;
         Serial.print("CTRL_CAS,tgt:"); Serial.print(runningTarget, 1);
         Serial.print(",yaw:"); Serial.print(data.yawAngle, 1);
-        Serial.print(",err:"); Serial.print(angleError, 1);
-        Serial.print(",dRate:"); Serial.print(desiredRate, 1);
-        Serial.print(",rateErr:"); Serial.print(rateError, 1);
+        Serial.print(",roll:"); Serial.print(data.rollAngle, 1); // Print Roll
+        Serial.print(",comp:"); Serial.print(tiltCompensation, 1); // Print Compensation
         Serial.print(",out:"); Serial.println(servoDelta, 1);
       }
     }

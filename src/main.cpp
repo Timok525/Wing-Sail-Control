@@ -291,8 +291,8 @@ void updateSensorData() {
     // Slowly decay the yaw angle towards zero to prevent long-term drift accumulation.
     // Since we don't have a compass, we can't hold absolute heading forever.
     // This makes the system act like a "rate damper" that resists change but eventually accepts new headings as "zero".
-    // tau_washout = 10.0s means errors decay by ~63% in 10 seconds.
-    const float tauWashout = 10.0f; 
+    // tau_washout = 60.0s means errors decay much slower, reducing offset after short disturbances.
+    const float tauWashout = 60.0f; 
     const float alphaWashout = dt / (tauWashout + dt);
     rawYaw = rawYaw * (1.0f - alphaWashout);
 
@@ -302,10 +302,19 @@ void updateSensorData() {
 
     measuredAngle = kalmanX.updateEstimate(rawYaw);
 
+    // Calculate Pitch and Roll from Accelerometer (in degrees)
+    // Pitch (Y-axis rotation): atan2(accX, accZ)
+    // Roll (X-axis rotation): atan2(accY, accZ)
+    // Note: This assumes the sensor is roughly horizontal.
+    float pitch = atan2(a.acceleration.x, a.acceleration.z) * 180.0f / PI;
+    float roll  = atan2(a.acceleration.y, a.acceleration.z) * 180.0f / PI;
+
     // Update sensor data structure atomically
     currentSensorData.yawAngle = measuredAngle;
     currentSensorData.rawYaw = rawYaw;
     currentSensorData.gyroRate = gyroRateFiltered;
+    currentSensorData.pitchAngle = pitch;
+    currentSensorData.rollAngle = roll;
     currentSensorData.dt = dt;
     currentSensorData.timestamp = now;
     currentSensorData.valid = true;
