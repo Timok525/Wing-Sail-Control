@@ -684,6 +684,50 @@ void processSerialCommand() {
   }
 }
 
+// Maneuver task for automated testing sequence
+void maneuverTask(void *parameter) {
+  // Wait for system initialization
+  vTaskDelay(pdMS_TO_TICKS(2000));
+  
+  Serial.println("=== Maneuver Sequence Started ===");
+  
+  // Phase 1: Hold 0 degrees for 10s
+  Serial.println("Phase 1: Target 0 deg (10s)");
+  controlSetTargetYaw(0.0f);
+  vTaskDelay(pdMS_TO_TICKS(10000));
+  
+  // Phase 2: Hold 25 degrees for 10s
+  Serial.println("Phase 2: Target 25 deg (10s)");
+  controlSetTargetYaw(25.0f);
+  vTaskDelay(pdMS_TO_TICKS(10000));
+
+  // Phase 2.5: Return to 0 degrees for 5s
+  Serial.println("Phase 2.5: Target 0 deg (5s)");
+  controlSetTargetYaw(0.0f);
+  vTaskDelay(pdMS_TO_TICKS(5000));
+  
+  // Phase 3: Hold -25 degrees for 10s
+  Serial.println("Phase 3: Target -25 deg (10s)");
+  controlSetTargetYaw(-25.0f);
+  vTaskDelay(pdMS_TO_TICKS(10000));
+  
+  // Phase 4: Step sequence (-25 -> -15 -> -7 -> 0 -> 7 -> 15 -> 25), 4.0s each
+  Serial.println("Phase 4: Step Sequence (-25 -> 25)");
+  
+  float steps[] = {-25.0f, -15.0f, -7.0f, 0.0f, 7.0f, 15.0f, 25.0f};
+  for (int i = 0; i < 7; i++) {
+    Serial.print("Step: Target "); Serial.print(steps[i]); Serial.println(" deg");
+    controlSetTargetYaw(steps[i]);
+    vTaskDelay(pdMS_TO_TICKS(4000));
+  }
+  
+  Serial.println("=== Maneuver Sequence Completed ===");
+  Serial.println("Holding final target (25 deg)...");
+  
+  // Task deletes itself when done
+  vTaskDelete(NULL);
+}
+
 void setup() {
   // Initialize serial communication
   Serial.begin(115200);
@@ -740,9 +784,10 @@ void setup() {
 
   // Explicitly reset control state (PIDs, target yaw)
   controlReset();
-  // Set target to 15 degrees for testing arbitrary angle tracking
-  controlSetTargetYaw(-15.0f);
-  Serial.println("System state reset: Servo centered, IMU zeroed, Control reset. Target set to 15.0 deg.");
+  Serial.println("System state reset: Servo centered, IMU zeroed, Control reset.");
+  
+  // Start the maneuver task
+  xTaskCreate(maneuverTask, "ManeuverTask", 4096, NULL, 1, NULL);
   
 #if ENABLE_WIFI
   Serial.println("WiFi mode enabled");
