@@ -292,7 +292,7 @@ void updateSensorData() {
     // Since we don't have a compass, we can't hold absolute heading forever.
     // This makes the system act like a "rate damper" that resists change but eventually accepts new headings as "zero".
     // tau_washout = 60.0s means errors decay much slower, reducing offset after short disturbances.
-    const float tauWashout = 60.0f; 
+    const float tauWashout = 60.0f; // washout滤波时间常数
     const float alphaWashout = dt / (tauWashout + dt);
     rawYaw = rawYaw * (1.0f - alphaWashout);
 
@@ -740,7 +740,9 @@ void setup() {
 
   // Explicitly reset control state (PIDs, target yaw)
   controlReset();
-  Serial.println("System state reset: Servo centered, IMU zeroed, Control reset.");
+  // Set target to 15 degrees for testing arbitrary angle tracking
+  controlSetTargetYaw(-15.0f);
+  Serial.println("System state reset: Servo centered, IMU zeroed, Control reset. Target set to 15.0 deg.");
   
 #if ENABLE_WIFI
   Serial.println("WiFi mode enabled");
