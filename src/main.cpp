@@ -72,7 +72,9 @@ float measuredAngle = 0.0f;         // Filtered yaw angle (degrees)
 volatile bool mpuInitialized = false;  // MPU6050 initialization status (volatile for multi-task access)
 
 // Kalman filter variables
-SimpleKalmanFilter kalmanX(1, 1, 0.01);  // SimpleKalmanFilter(e_mea, e_est, q)
+// Parameters: e_mea (measurement error), e_est (estimation error), q (process noise)
+// Lower q = smoother output but slower response
+SimpleKalmanFilter kalmanX(2, 2, 0.005);  // More aggressive smoothing
 float gyroZoffset = 0.0f;           // Gyroscope Z-axis zero drift compensation
 unsigned long timer;                // Timer for calculating dt between readings
 
@@ -532,10 +534,13 @@ void ledControlTask(void *parameter) {
 }
 
 // Serial output task - prints key information with timing data
+// NOTE: Disabled during maneuverTask to avoid serial conflicts
 void serialTask(void *parameter) {
   const TickType_t xDelay = pdMS_TO_TICKS(SERIAL_PRINT_INTERVAL);
   
   for (;;) {
+    // Disabled: maneuverTask handles TRACK output, avoid conflicts
+    /*
     if (mpuInitialized) {
       SensorData data = getSensorData();
       
@@ -562,6 +567,7 @@ void serialTask(void *parameter) {
         Serial.println("MSG,INVALID,INVALID,INVALID,INVALID,INVALID");
       }
     }
+    */
     vTaskDelay(xDelay);
   }
 }
@@ -691,6 +697,25 @@ void maneuverTask(void *parameter) {
   
   Serial.println("=== Maneuver Sequence Started ===");
   
+  // Simple test: Hold at 0 degrees indefinitely
+  Serial.println("Holding at 0 deg...");
+  controlSetTargetYaw(0.0f);
+  
+  // Keep outputting tracking data at 50Hz
+  unsigned long trackingStart = millis();
+  while (true) {
+    SensorData data = getSensorData();
+    Serial.print("TRACK,");
+    Serial.print(millis() - trackingStart);
+    Serial.print(",");
+    Serial.print(0.0f, 2);  // Target is always 0
+    Serial.print(",");
+    Serial.println(data.yawAngle, 2);
+    
+    vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz update
+  }
+  
+  /* 
   // Phase 1: Hold 0 degrees for 10s
   Serial.println("Phase 1: Target 0 deg (10s)");
   controlSetTargetYaw(0.0f);
@@ -710,19 +735,96 @@ void maneuverTask(void *parameter) {
   Serial.println("Phase 3: Target -25 deg (10s)");
   controlSetTargetYaw(-25.0f);
   vTaskDelay(pdMS_TO_TICKS(10000));
+
+  // Phase 3.5: Return to 0 degrees for 5s (Prepare for tracking)
+  Serial.println("Phase 3.5: Return to 0 deg (5s)");
+  controlSetTargetYaw(0.0f);
+  vTaskDelay(pdMS_TO_TICKS(5000));
   
-  // Phase 4: Step sequence (-25 -> -15 -> -7 -> 0 -> 7 -> 15 -> 25), 4.0s each
-  Serial.println("Phase 4: Step Sequence (-25 -> 25)");
+  // Phase 4: Trapezoid Wave Tracking (Random segments)
+  // More suitable for systems with significant delay - has flat holding periods
+  Serial.println("Phase 4: Trapezoid Wave Tracking (Random Segments)");
   
-  float steps[] = {-25.0f, -15.0f, -7.0f, 0.0f, 7.0f, 15.0f, 25.0f};
-  for (int i = 0; i < 7; i++) {
-    Serial.print("Step: Target "); Serial.print(steps[i]); Serial.println(" deg");
-    controlSetTargetYaw(steps[i]);
-    vTaskDelay(pdMS_TO_TICKS(4000));
+  // Define a random trapezoid sequence: {target_angle, ramp_time_ms, hold_time_ms}
+  // Format: Ramp from previous target to this target over ramp_time, then hold for hold_time
+  struct TrapezoidSegment {
+    float targetAngle;
+    unsigned long rampTimeMs;
+    unsigned long holdTimeMs;
+  };
+  
+  // Pre-defined "random" trapezoid sequence for repeatable testing
+  TrapezoidSegment segments[] = {
+    {  0.0f, 1000, 5000 },  // Start at 0, hold 5s
+    { 20.0f, 2000, 5000 },  // Ramp to 20 over 2s, hold 4s
+    { 10.0f, 1500, 5000 },  // Ramp to 10 over 1.5s, hold 3s
+    {-15.0f, 2500, 5000 },  // Ramp to -15 over 2.5s, hold 4s
+    { -5.0f, 1000, 5000 },  // Ramp to -5 over 1s, hold 3s
+    { 25.0f, 3000, 5000 },  // Ramp to 25 over 3s, hold 5s
+    {  0.0f, 2500, 5000 },  // Ramp to 0 over 2.5s, hold 3s
+    {-25.0f, 2000, 5000 },  // Ramp to -25 over 2s, hold 4s
+    { 15.0f, 3000, 5000 },  // Ramp to 15 over 3s, hold 4s
+    {  0.0f, 2000, 5000 },  // Return to 0 over 2s, hold 3s (end)
+  };
+  const int numSegments = sizeof(segments) / sizeof(segments[0]);
+  
+  float currentTarget = 0.0f; // Starting point
+  
+  for (int i = 0; i < numSegments; i++) {
+    float startAngle = currentTarget;
+    float endAngle = segments[i].targetAngle;
+    unsigned long rampTime = segments[i].rampTimeMs;
+    unsigned long holdTime = segments[i].holdTimeMs;
+    
+    Serial.print("Segment "); Serial.print(i + 1);
+    Serial.print(": Ramp "); Serial.print(startAngle, 1);
+    Serial.print(" -> "); Serial.print(endAngle, 1);
+    Serial.print(" ("); Serial.print(rampTime); Serial.print("ms), Hold ");
+    Serial.print(holdTime); Serial.println("ms");
+    
+    // Ramp phase: linearly interpolate from startAngle to endAngle
+    unsigned long rampStart = millis();
+    unsigned long trackingStart = millis(); // For plotting timestamp
+    while (millis() - rampStart < rampTime) {
+      float t = (float)(millis() - rampStart) / (float)rampTime; // 0.0 to 1.0
+      float target = startAngle + t * (endAngle - startAngle);
+      controlSetTargetYaw(target);
+      
+      // Output tracking data: TRACK,time_ms,target,measured
+      SensorData data = getSensorData();
+      Serial.print("TRACK,");
+      Serial.print(millis() - trackingStart);
+      Serial.print(",");
+      Serial.print(target, 2);
+      Serial.print(",");
+      Serial.println(data.yawAngle, 2);
+      
+      vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz update
+    }
+    
+    // Ensure we hit the exact target at end of ramp
+    controlSetTargetYaw(endAngle);
+    currentTarget = endAngle;
+    
+    // Hold phase: maintain the target angle, keep outputting data
+    unsigned long holdStart = millis();
+    while (millis() - holdStart < holdTime) {
+      SensorData data = getSensorData();
+      Serial.print("TRACK,");
+      Serial.print(millis() - trackingStart);
+      Serial.print(",");
+      Serial.print(endAngle, 2);
+      Serial.print(",");
+      Serial.println(data.yawAngle, 2);
+      
+      vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz update
+    }
   }
+  */
   
   Serial.println("=== Maneuver Sequence Completed ===");
-  Serial.println("Holding final target (25 deg)...");
+  Serial.println("Holding final target (0 deg)...");
+  controlSetTargetYaw(0.0f);
   
   // Task deletes itself when done
   vTaskDelete(NULL);
