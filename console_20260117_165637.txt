@@ -1,0 +1,9 @@
+Connected to COM10. Logging to log_20260117_165620.csv
+[DEV] t, desired_rate, rate_cmd)
+[DEV] o | o1 | o0 - toggle | enable | disable invert of control output (reverse direction)
+[DEV] m<deg> - set controller +/- angle limit in degrees (e.g. m25). No arg prints current limit.
+[DEV] d | d1 | d0 - toggle | enable | disable control debug prints
+[DEV] ERROR: Unknown command. Use s<angle>, c<0|1>, t<yaw>, C for status
+[DEV] === Maneuver Sequence Started ===
+[DEV] Holding at 0 deg...
+Screenshot saved: plot_20260117_165628.png

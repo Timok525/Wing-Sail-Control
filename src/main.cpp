@@ -3,12 +3,14 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <SPIFFS.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <Wire.h>
-#include <SimpleKalmanFilter.h>  // Add SimpleKalmanFilter library
+// #include <Adafruit_MPU6050.h>
+// #include <Adafruit_Sensor.h>
+// #include <Wire.h>
+// #include <SimpleKalmanFilter.h>  // Add SimpleKalmanFilter library
+// #include <HardwareSerial.h> // Moved to h30_imu.cpp
 
 #include "control/control.h"
+#include "h30_imu.h" // Add H30 module
 
 // Add FreeRTOS includes
 #include "freertos/FreeRTOS.h"
@@ -32,9 +34,19 @@
 #define SERVO_MID_PULSE 307   // 1.5ms/20ms * 4095 ≈ 307 (90 degrees)
 #define SERVO_MAX_PULSE 512   // 2.5ms/20ms * 4095 ≈ 512 (180 degrees)
 
-// I2C pins for MPU6050
-#define SDA_PIN 5  // GPIO5 for SDA according to XIAO ESP32S3 pinout
-#define SCL_PIN 6  // GPIO6 for SCL according to XIAO ESP32S3 pinout
+// I2C pins for MPU6050 (Disabled)
+// #define SDA_PIN 5  // GPIO5 for SDA according to XIAO ESP32S3 pinout
+// #define SCL_PIN 6  // GPIO6 for SCL according to XIAO ESP32S3 pinout
+
+// UART pins for H30
+#define H30_RX_PIN 3  // Module TXD connected here (ESP32 RX)
+#define H30_TX_PIN 2  // Module RXD connected here (ESP32 TX)
+#define H30_BAUD 921600
+
+// UART pins for LORA
+#define LORA_RX_PIN 5  // LORA TXD connected here (ESP32 RX)
+#define LORA_TX_PIN 4  // LORA RXD connected here (ESP32 TX)
+#define LORA_BAUD 115200
 
 // WiFi configuration
 #define ENABLE_WIFI false        // Set to false for serial-only mode (no WiFi/WebServer)
@@ -55,6 +67,24 @@
 // Web server
 WebServer server(80);
 
+// Use UART2 for LoRa
+HardwareSerial LoRaSerial(2);
+
+// Dual channel output (USB + LoRa)
+class DualPrint : public Print {
+public:
+  size_t write(uint8_t c) override {
+    size_t n = Serial.write(c);
+    LoRaSerial.write(c);
+    return n;
+  }
+  size_t write(const uint8_t *buffer, size_t size) override {
+    size_t n = Serial.write(buffer, size);
+    LoRaSerial.write(buffer, size);
+    return n;
+  }
+} Console;
+
 // Global variables
 int currentServoAngle = 90;  // Current servo angle
 String apSSID = "ServoControl_AP";
@@ -66,17 +96,11 @@ bool ledState = false;       // LED state
 bool restartPending = false;
 unsigned long restartTime = 0;
 
-// MPU6050 variables
-Adafruit_MPU6050 mpu;
-float measuredAngle = 0.0f;         // Filtered yaw angle (degrees)
-volatile bool mpuInitialized = false;  // MPU6050 initialization status (volatile for multi-task access)
-
-// Kalman filter variables
-// Parameters: e_mea (measurement error), e_est (estimation error), q (process noise)
-// Lower q = smoother output but slower response
-SimpleKalmanFilter kalmanX(2, 2, 0.005);  // More aggressive smoothing
-float gyroZoffset = 0.0f;           // Gyroscope Z-axis zero drift compensation
-unsigned long timer;                // Timer for calculating dt between readings
+// H30 IMU variables
+float measuredAngle = 0.0f;           // Yaw angle
+// volatile bool mpuInitialized = false;  // Removed, use H30_IsInitialized()
+// float yawOffset = 0.0f;               // Moved to H30 module
+// volatile bool zeroingRequest = true;  // Moved to H30 module
 
 // Sensor snapshot used by MPU and control task (defined in include/system_api.h)
 SensorData currentSensorData = {0.0f, 0.0f, 0.0f, 0.0f, 0, false}; //0.0f表示直接初始化为浮点型0
@@ -173,148 +197,53 @@ void setServoAngle(int angle) {
     xSemaphoreGive(servoMutex);
     
     // Print outside critical section to avoid blocking
-    Serial.print("Servo: ");
-    Serial.print(angle);
-    Serial.print("° PWM:");
-    Serial.println(pulse);
+    // Console.print("Servo: ");
+    // Console.print(angle);
+    // Console.print("* PWM:");
+    // Console.println(pulse);
   } else {
-    Serial.println("ERROR: Failed to acquire servo mutex");
+    Console.println("ERROR: Failed to acquire servo mutex");
   }
 }
 
-// MPU6050 initialization function
-bool initMPU6050() {
-  // Initialize I2C with specified SDA and SCL pins
-  Wire.begin(SDA_PIN, SCL_PIN);
-  
-  if (!mpu.begin()) {
-    Serial.println("Failed to find MPU6050 chip");
-    return false;
-  }
-  
-  Serial.println("MPU6050 Found!");
-  
-  // Configure accelerometer range (±2, 4, 8, or 16 G)
-  mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
-  // Configure gyroscope range (250, 500, 1000, or 2000 degrees/second)
-  // Lower range = higher sensitivity for small movements
-  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
-  // Configure filter bandwidth (5, 10, 21, 44, 94, 184, 260 Hz)
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  
-  vTaskDelay(pdMS_TO_TICKS(100));
-  
-  // Calibrate gyroscope - calculate zero drift offset
-  Serial.println("Calibrating gyroscope (Z-axis), keep the sensor still...");
-  for (int i = 0; i < 2000; i++) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    gyroZoffset += g.gyro.z;
-    vTaskDelay(pdMS_TO_TICKS(1));
-  }
-  gyroZoffset /= 2000.0f;
-  Serial.print("Gyro Z offset: ");
-  Serial.println(gyroZoffset);
-  
-  // Initialize timer for dt calculation
-  timer = micros();
-  
-  Serial.println("Kalman filter initialized");
-  return true;
-}
+// Helper timer
+unsigned long timer = 0; // Timer for calculating dt between readings
 
 // Global variables for IMU tracking
-static float rawYaw = 0.0f;
-static bool yawInitialized = false;
-static float gyroRateFiltered = 0.0f;
+// static float rawYaw = 0.0f;
+// static bool yawInitialized = false;
+// static float gyroRateFiltered = 0.0f;
 
 // Reset IMU state to zero
 void resetIMU() {
-  if (xSemaphoreTake(angleMutex, portMAX_DELAY)) {
-    measuredAngle = 0.0f;
-    rawYaw = 0.0f;
-    yawInitialized = false; 
-    gyroRateFiltered = 0.0f;
-    kalmanX = SimpleKalmanFilter(1, 1, 0.01);
-    xSemaphoreGive(angleMutex);
-    Serial.println("IMU data reset to zero");
-  }
+    H30_RequestZero();
 }
 
 // Update sensor data with timestamp - called by MPU task
 void updateSensorData() {
-  if (!mpuInitialized) {
-    currentSensorData.valid = false;
-    return;
-  }
-
   if (xSemaphoreTake(angleMutex, portMAX_DELAY)) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-
     unsigned long now = micros();
     float dt = (now - timer) / 1000000.0f;
     timer = now;
-
+    
     // Guard against invalid or excessively large time steps
     if (dt <= 0.0f || dt > 0.2f) {
       dt = 0.02f; // Assume nominal 50 Hz update if timing glitch occurs
     }
+    
+    // Get Data from H30 Module
+    float yaw = H30_GetYaw();
+    float rawYaw = H30_GetRawYaw();
+    float pitch = H30_GetPitch();
+    float roll = H30_GetRoll();
+    float gyroRateZ = H30_GetGyroZ();
 
-    // Convert rad/s to deg/s (bias compensated)
-    const float gyroRateDeg = (g.gyro.z - gyroZoffset) * 180.0f / PI;
-
-    // Light low-pass on gyro rate to reduce noise sensitivity in the rate loop
-    // tau=0.05s gives small delay but noticeably less jitter
-    const float tauRate = 0.05f;
-    const float alphaRate = dt / (tauRate + dt);
-    gyroRateFiltered += alphaRate * (gyroRateDeg - gyroRateFiltered);
-
-    // Online bias tracking (reduces yaw drift over time):
-    // When the system is near-stationary, slowly adapt gyroZoffset towards current reading.
-    // This helps compensate temperature drift and vibration-induced bias changes.
-    const int servoAngleSnapshot = currentServoAngle; // ok to read without mutex (int is atomic on ESP32)
-    const bool nearCenter = (abs(servoAngleSnapshot - 90) <= 3);
-    const bool nearStill = (fabsf(gyroRateFiltered) <= 0.5f);
-    if (nearCenter && nearStill) {
-      const float tauBias = 20.0f; // seconds (slow)
-      const float alphaBias = dt / (tauBias + dt);
-      gyroZoffset += alphaBias * (g.gyro.z - gyroZoffset); // gyroZoffset is in rad/s
-    }
-
-    if (!yawInitialized) {
-      rawYaw = measuredAngle;
-      yawInitialized = true;
-    }
-
-    rawYaw += gyroRateFiltered * dt;
-
-    // Washout filter (High-pass behavior for Yaw):
-    // Slowly decay the yaw angle towards zero to prevent long-term drift accumulation.
-    // Since we don't have a compass, we can't hold absolute heading forever.
-    // This makes the system act like a "rate damper" that resists change but eventually accepts new headings as "zero".
-    // tau_washout = 60.0s means errors decay much slower, reducing offset after short disturbances.
-    const float tauWashout = 60.0f; // washout滤波时间常数
-    const float alphaWashout = dt / (tauWashout + dt);
-    rawYaw = rawYaw * (1.0f - alphaWashout);
-
-    // Keep raw yaw within [-180, 180] to avoid overflow
-    if (rawYaw > 180.0f) rawYaw -= 360.0f;
-    if (rawYaw < -180.0f) rawYaw += 360.0f;
-
-    measuredAngle = kalmanX.updateEstimate(rawYaw);
-
-    // Calculate Pitch and Roll from Accelerometer (in degrees)
-    // Pitch (Y-axis rotation): atan2(accX, accZ)
-    // Roll (X-axis rotation): atan2(accY, accZ)
-    // Note: This assumes the sensor is roughly horizontal.
-    float pitch = atan2(a.acceleration.x, a.acceleration.z) * 180.0f / PI;
-    float roll  = atan2(a.acceleration.y, a.acceleration.z) * 180.0f / PI;
+    measuredAngle = yaw;
 
     // Update sensor data structure atomically
-    currentSensorData.yawAngle = measuredAngle;
-    currentSensorData.rawYaw = rawYaw;
-    currentSensorData.gyroRate = gyroRateFiltered;
+    currentSensorData.yawAngle = yaw;
+    currentSensorData.rawYaw = rawYaw; // Keep absolute raw
+    currentSensorData.gyroRate = gyroRateZ;
     currentSensorData.pitchAngle = pitch;
     currentSensorData.rollAngle = roll;
     currentSensorData.dt = dt;
@@ -335,12 +264,8 @@ SensorData getSensorData() {
   return data;
 }
 
-// Read MPU6050 angle - returns mapped angle for web interface (0-180)
+// Read IMU angle - returns mapped angle for web interface (0-180)
 float readMPUAngle() {
-  if (!mpuInitialized) {
-    return mapFloat(constrain(measuredAngle, -90.0f, 90.0f), -90.0f, 90.0f, 0.0f, 180.0f);
-  }
-  
   float clamped = constrain(measuredAngle, -90.0f, 90.0f);
   return mapFloat(clamped, -90.0f, 90.0f, 0.0f, 180.0f);
 }
@@ -352,12 +277,12 @@ void loadWiFiConfig() {
   EEPROM.end();
   
   if (wifiConfig.configured) {
-    Serial.println("WiFi configuration loaded from EEPROM");
-    Serial.print("SSID: ");
-    Serial.println(wifiConfig.ssid);
+    Console.println("WiFi configuration loaded from EEPROM");
+    Console.print("SSID: ");
+    Console.println(wifiConfig.ssid);
     wifiConfigured = true;
   } else {
-    Serial.println("No WiFi configuration found in EEPROM");
+    Console.println("No WiFi configuration found in EEPROM");
     wifiConfigured = false;
   }
 }
@@ -368,15 +293,15 @@ void saveWiFiConfig() {
   EEPROM.put(0, wifiConfig);
   EEPROM.commit();
   EEPROM.end();
-  Serial.println("WiFi configuration saved to EEPROM");
+  Console.println("WiFi configuration saved to EEPROM");
 }
 
 // Start AP mode
 void startAPMode() {
   WiFi.softAP(apSSID.c_str(), apPassword.c_str());
   IPAddress IP = WiFi.softAPIP();
-  Serial.print("AP mode started. IP address: ");
-  Serial.println(IP);
+  Console.print("AP mode started. IP address: ");
+  Console.println(IP);
   
   // Set LED to slow blink for AP mode
   setLedMode(LED_AP_MODE);
@@ -386,8 +311,8 @@ void startAPMode() {
 bool connectToWiFi() {
   if (!wifiConfigured) return false;
   
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(wifiConfig.ssid);
+  Console.print("Connecting to WiFi: ");
+  Console.println(wifiConfig.ssid);
   
   // Set LED to fast blink for WiFi connecting
   setLedMode(LED_WIFI_CONNECTING);
@@ -397,22 +322,22 @@ bool connectToWiFi() {
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     vTaskDelay(pdMS_TO_TICKS(500));
-    Serial.print(".");
+    Console.print(".");
     attempts++;
   }
   
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("");
-    Serial.print("Connected to WiFi. IP address: ");
-    Serial.println(WiFi.localIP());
+    Console.println("");
+    Console.print("Connected to WiFi. IP address: ");
+    Console.println(WiFi.localIP());
     
     // Set LED to solid ON for connected state
     turnLedOn();
     
     return true;
   } else {
-    Serial.println("");
-    Serial.println("Failed to connect to WiFi");
+    Console.println("");
+    Console.println("Failed to connect to WiFi");
     return false;
   }
 }
@@ -442,7 +367,7 @@ void handleWiFiConfig() {
 // Handle measured angle requests
 void handleGetMeasuredAngle() {
   float angle = readMPUAngle();
-  server.send(200, "application/json", "{\"angle\":" + String(angle, 2) + ", \"status\":" + String(mpuInitialized ? "true" : "false") + "}");
+  server.send(200, "application/json", "{\"angle\":" + String(angle, 2) + ", \"status\":" + String(H30_IsInitialized() ? "true" : "false") + "}");
 }
 
 // Save WiFi configuration
@@ -492,17 +417,17 @@ void webServerTask(void *parameter) {
   }
 }
 
-// MPU sensor reading task - high priority for control loop timing
+// H30 sensor reading task - reads serial data
 void mpuTask(void *parameter) {
-  const TickType_t xDelay = pdMS_TO_TICKS(20); // 20ms = 50Hz update rate
-  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xDelay = pdMS_TO_TICKS(2); // Short delay to allow other tasks but check serial frequently
   
   for (;;) {
-    if (mpuInitialized) {
-      updateSensorData(); // Update sensor data with precise timing
+    while (H30_Available()) {
+        if (H30_ParseByte(H30_Read())) {
+             updateSensorData();
+        }
     }
-    // Use vTaskDelayUntil for precise periodic execution (important for control loops)
-    vTaskDelayUntil(&xLastWakeTime, xDelay);
+    vTaskDelay(xDelay); 
   }
 }
 
@@ -573,144 +498,177 @@ void serialTask(void *parameter) {
 }
 
 // Process serial commands (format: s<angle>)
+void handleCommand(String command) {
+  command.trim();
+  if (command.length() == 0) return;
+
+  if (command.equalsIgnoreCase("help") || command == "?") {
+    Console.println("=== Commands ===");
+    Console.println("s<angle>: Set servo angle (0-180). e.g. s90");
+    Console.println("c[0|1]  : Auto-Control enable/disable (c, c1, c0)");
+    Console.println("t<angle>: Set target yaw (-180..180). e.g. t30");
+    Console.println("C       : Status (target, rate, servo)");
+    Console.println("m<deg>  : Set max angle offset (0-90). e.g. m25");
+    Console.println("o[0|1]  : Invert control output (o, o1, o0)");
+    Console.println("d[0|1]  : Toggle debug prints (d, d1, d0)");
+    Console.println("help/?  : Show this help");
+    return;
+  }
+
+  if (command.charAt(0) == 's' || command.charAt(0) == 'S') {
+    // Extract angle from command (e.g., "s90" -> 90)
+    String angleStr = command.substring(1);
+    int angle = angleStr.toInt();
+    
+    if (angle >= 0 && angle <= 180) {
+      setServoAngle(angle);
+      Console.print("OK: Servo set to ");
+      Console.println(angle);
+    } else {
+      Console.println("ERROR: Angle must be 0-180");
+    }
+  } else if (command.charAt(0) == 'c') {
+    // Enable/disable cascaded auto-control: c1=c ON, c0=c OFF, c toggle
+    if (command.length() == 1) {
+      bool cur = controlIsEnabled();
+      controlEnable(!cur);
+      Console.print("Auto-control ");
+      Console.println(!cur ? "enabled" : "disabled");
+    } else {
+      String arg = command.substring(1);
+      arg.trim();
+      if (arg == "1") { controlEnable(true); Console.println("Auto-control enabled"); }
+      else if (arg == "0") { controlEnable(false); Console.println("Auto-control disabled"); }
+      else { Console.println("ERROR: Unknown argument for c. Use c0 or c1"); }
+    }
+  } else if (command.charAt(0) == 't' || command.charAt(0) == 'T') {
+    // Set target yaw for auto control: t<deg> (e.g., t-30)
+    String angleStr = command.substring(1);
+    angleStr.trim();
+    float yaw = angleStr.toFloat();
+    if (yaw >= -360.0f && yaw <= 360.0f) {
+      // normalize
+      while (yaw > 180.0f) yaw -= 360.0f;
+      while (yaw < -180.0f) yaw += 360.0f;
+      controlSetTargetYaw(yaw);
+      Console.print("OK: target yaw set to ");
+      Console.println(yaw);
+    } else {
+      Console.println("ERROR: yaw out of range (-360..360)");
+    }
+  } else if (command.charAt(0) == 'C') {
+    // Print control status (telemetry) — adapt for current controller API
+    Console.print("CTRL,");
+    Console.print(controlIsEnabled() ? "ENABLED," : "DISABLED,");
+    Console.print(controlGetTargetYaw(), 2);
+    Console.print(",desired_rate(deg/s):");
+    Console.print(controlGetLastDesiredRate(), 2);
+    Console.print(",rate_cmd(deg):");
+    Console.print(controlGetLastRateCommand(), 2);
+    Console.print(",limit:");
+    Console.print(controlGetMaxAngleOffset(), 2);
+    Console.print(",invert:");
+    Console.print(controlIsOutputInverted() ? "1" : "0");
+    Console.print(",servo:");
+    Console.println(getCurrentServoAngle());
+  } else if (command.charAt(0) == 'd' || command.charAt(0) == 'D') {
+    // Toggle or set control debug printing: d  -> toggle, d1 -> enable, d0 -> disable
+    String arg = command.substring(1);
+    arg.trim();
+    if (arg.length() == 0) {
+      bool cur = controlIsDebug();
+      controlSetDebug(!cur);
+      Console.print("Control debug "); Console.println(!cur ? "enabled" : "disabled");
+    } else if (arg == "1") {
+      controlSetDebug(true);
+      Console.println("Control debug enabled");
+    } else if (arg == "0") {
+      controlSetDebug(false);
+      Console.println("Control debug disabled");
+    } else {
+      Console.println("ERROR: d usage: d (toggle) | d1 (on) | d0 (off)");
+    }
+  } else if (command.charAt(0) == 'o' || command.charAt(0) == 'O') {
+    // Toggle or set inversion of control output: o  -> toggle, o1 -> enable, o0 -> disable
+    String arg = command.substring(1);
+    arg.trim();
+    if (arg.length() == 0) {
+      bool cur = controlIsOutputInverted();
+      controlSetInvertOutput(!cur);
+      Console.print("Control invert "); Console.println(!cur ? "enabled" : "disabled");
+    } else if (arg == "1") {
+      controlSetInvertOutput(true);
+      Console.println("Control invert enabled");
+    } else if (arg == "0") {
+      controlSetInvertOutput(false);
+      Console.println("Control invert disabled");
+    } else {
+      Console.println("ERROR: o usage: o (toggle) | o1 (on) | o0 (off)");
+    }
+  } else if (command.charAt(0) == 'm' || command.charAt(0) == 'M') {
+    // Set or query max angle offset: m -> print current, m25 -> set to 25 degrees
+    String arg = command.substring(1);
+    arg.trim();
+    if (arg.length() == 0) {
+      Console.print("Current control max angle offset: ");
+      Console.println(controlGetMaxAngleOffset(), 2);
+    } else {
+      float val = arg.toFloat();
+      if (val < 0.0f || val > 90.0f) {
+        Console.println("ERROR: max offset must be 0..90 deg");
+      } else {
+        controlSetMaxAngleOffset(val);
+        Console.print("OK: max angle offset set to "); Console.println(val, 2);
+      }
+    }
+  } else {
+    Console.println("ERROR: Unknown command. Use s<angle>, c<0|1>, t<yaw>, C for status");
+  }
+}
+
 void processSerialCommand() {
   if (Serial.available() > 0) {
-    String command = Serial.readStringUntil('\n');
-    command.trim();
-    
-    if (command.length() > 0 && (command.charAt(0) == 's' || command.charAt(0) == 'S')) {
-      // Extract angle from command (e.g., "s90" -> 90)
-      String angleStr = command.substring(1);
-      int angle = angleStr.toInt();
-      
-      if (angle >= 0 && angle <= 180) {
-        setServoAngle(angle);
-        Serial.print("OK: Servo set to ");
-        Serial.println(angle);
-      } else {
-        Serial.println("ERROR: Angle must be 0-180");
-      }
-    } else if (command.length() > 0 && (command.charAt(0) == 'c')) {
-      // Enable/disable cascaded auto-control: c1=c ON, c0=c OFF, c toggle
-      if (command.length() == 1) {
-        bool cur = controlIsEnabled();
-        controlEnable(!cur);
-        Serial.print("Auto-control ");
-        Serial.println(!cur ? "enabled" : "disabled");
-      } else {
-        String arg = command.substring(1);
-        arg.trim();
-        if (arg == "1") { controlEnable(true); Serial.println("Auto-control enabled"); }
-        else if (arg == "0") { controlEnable(false); Serial.println("Auto-control disabled"); }
-        else { Serial.println("ERROR: Unknown argument for c. Use c0 or c1"); }
-      }
-    } else if (command.length() > 0 && (command.charAt(0) == 't' || command.charAt(0) == 'T')) {
-      // Set target yaw for auto control: t<deg> (e.g., t-30)
-      String angleStr = command.substring(1);
-      angleStr.trim();
-      float yaw = angleStr.toFloat();
-      if (yaw >= -360.0f && yaw <= 360.0f) {
-        // normalize
-        while (yaw > 180.0f) yaw -= 360.0f;
-        while (yaw < -180.0f) yaw += 360.0f;
-        controlSetTargetYaw(yaw);
-        Serial.print("OK: target yaw set to ");
-        Serial.println(yaw);
-      } else {
-        Serial.println("ERROR: yaw out of range (-360..360)");
-      }
-    } else if (command.length() > 0 && (command.charAt(0) == 'C')) {
-      // Print control status (telemetry) — adapt for current controller API
-      Serial.print("CTRL,");
-      Serial.print(controlIsEnabled() ? "ENABLED," : "DISABLED,");
-      Serial.print(controlGetTargetYaw(), 2);
-      Serial.print(",desired_rate(deg/s):");
-      Serial.print(controlGetLastDesiredRate(), 2);
-      Serial.print(",rate_cmd(deg):");
-      Serial.print(controlGetLastRateCommand(), 2);
-      Serial.print(",limit:");
-      Serial.print(controlGetMaxAngleOffset(), 2);
-      Serial.print(",invert:");
-      Serial.print(controlIsOutputInverted() ? "1" : "0");
-      Serial.print(",servo:");
-      Serial.println(getCurrentServoAngle());
-    } else if (command.length() > 0 && (command.charAt(0) == 'd' || command.charAt(0) == 'D')) {
-      // Toggle or set control debug printing: d  -> toggle, d1 -> enable, d0 -> disable
-      String arg = command.substring(1);
-      arg.trim();
-      if (arg.length() == 0) {
-        bool cur = controlIsDebug();
-        controlSetDebug(!cur);
-        Serial.print("Control debug "); Serial.println(!cur ? "enabled" : "disabled");
-      } else if (arg == "1") {
-        controlSetDebug(true);
-        Serial.println("Control debug enabled");
-      } else if (arg == "0") {
-        controlSetDebug(false);
-        Serial.println("Control debug disabled");
-      } else {
-        Serial.println("ERROR: d usage: d (toggle) | d1 (on) | d0 (off)");
-      }
-    } else if (command.length() > 0 && (command.charAt(0) == 'o' || command.charAt(0) == 'O')) {
-      // Toggle or set inversion of control output: o  -> toggle, o1 -> enable, o0 -> disable
-      String arg = command.substring(1);
-      arg.trim();
-      if (arg.length() == 0) {
-        bool cur = controlIsOutputInverted();
-        controlSetInvertOutput(!cur);
-        Serial.print("Control invert "); Serial.println(!cur ? "enabled" : "disabled");
-      } else if (arg == "1") {
-        controlSetInvertOutput(true);
-        Serial.println("Control invert enabled");
-      } else if (arg == "0") {
-        controlSetInvertOutput(false);
-        Serial.println("Control invert disabled");
-      } else {
-        Serial.println("ERROR: o usage: o (toggle) | o1 (on) | o0 (off)");
-      }
-    } else if (command.length() > 0 && (command.charAt(0) == 'm' || command.charAt(0) == 'M')) {
-      // Set or query max angle offset: m -> print current, m25 -> set to 25 degrees
-      String arg = command.substring(1);
-      arg.trim();
-      if (arg.length() == 0) {
-        Serial.print("Current control max angle offset: ");
-        Serial.println(controlGetMaxAngleOffset(), 2);
-      } else {
-        float val = arg.toFloat();
-        if (val < 0.0f || val > 90.0f) {
-          Serial.println("ERROR: max offset must be 0..90 deg");
-        } else {
-          controlSetMaxAngleOffset(val);
-          Serial.print("OK: max angle offset set to "); Serial.println(val, 2);
-        }
-      }
-    } else if (command.length() > 0) {
-      Serial.println("ERROR: Unknown command. Use s<angle>, c<0|1>, t<yaw>, C for status");
-    }
+    handleCommand(Serial.readStringUntil('\n'));
+  }
+  if (LoRaSerial.available() > 0) {
+    handleCommand(LoRaSerial.readStringUntil('\n'));
   }
 }
 
 // Maneuver task for automated testing sequence
 void maneuverTask(void *parameter) {
-  // Wait for system initialization
+  // Wait for system initialization and sensor stabilization
   vTaskDelay(pdMS_TO_TICKS(2000));
   
-  Serial.println("=== Maneuver Sequence Started ===");
+  // Re-zero IMU after stabilization period
+  resetIMU();
+  vTaskDelay(pdMS_TO_TICKS(200)); // Wait for next sensor update to apply the offset
+
+  Console.println("=== Maneuver Sequence Started ===");
   
   // Simple test: Hold at 0 degrees indefinitely
-  Serial.println("Holding at 0 deg...");
+  Console.println("Holding at 0 deg...");
   controlSetTargetYaw(0.0f);
   
   // Keep outputting tracking data at 50Hz
   unsigned long trackingStart = millis();
   while (true) {
     SensorData data = getSensorData();
-    Serial.print("TRACK,");
-    Serial.print(millis() - trackingStart);
-    Serial.print(",");
-    Serial.print(0.0f, 2);  // Target is always 0
-    Serial.print(",");
-    Serial.println(data.yawAngle, 2);
+    int sAngle = getCurrentServoAngle();
+    int sPulse = angleToPulse(sAngle);
+    
+    Console.print("TRACK,");
+    Console.print(millis() - trackingStart);
+    Console.print(",");
+    Console.print(0.0f, 2);  // Target is always 0
+    Console.print(",");
+    Console.print(data.yawAngle, 2);
+    Console.print(",");
+    Console.print(data.gyroRate, 2);
+    Console.print(",");
+    Console.print(sAngle);
+    Console.print(",");
+    Console.println(sPulse);
     
     vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz update
   }
@@ -797,7 +755,9 @@ void maneuverTask(void *parameter) {
       Serial.print(",");
       Serial.print(target, 2);
       Serial.print(",");
-      Serial.println(data.yawAngle, 2);
+      Serial.print(data.yawAngle, 2);
+      Serial.print(",");
+      Serial.println(data.gyroRate, 2);
       
       vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz update
     }
@@ -815,7 +775,9 @@ void maneuverTask(void *parameter) {
       Serial.print(",");
       Serial.print(endAngle, 2);
       Serial.print(",");
-      Serial.println(data.yawAngle, 2);
+      Serial.print(data.yawAngle, 2);
+      Serial.print(",");
+      Serial.println(data.gyroRate, 2);
       
       vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz update
     }
@@ -833,7 +795,9 @@ void maneuverTask(void *parameter) {
 void setup() {
   // Initialize serial communication
   Serial.begin(115200);
-  Serial.println("Servo Control System Initializing with FreeRTOS...");
+  LoRaSerial.begin(LORA_BAUD, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
+  
+  Console.println("Servo Control System Initializing with FreeRTOS...");
   
   // Initialize LED
   pinMode(LED_PIN, OUTPUT);
@@ -847,18 +811,18 @@ void setup() {
   
   // Verify mutex creation
   if (!angleMutex || !servoMutex || !wifiMutex || !ledMutex) {
-    Serial.println("FATAL: Failed to create mutexes");
+    Console.println("FATAL: Failed to create mutexes");
     while(1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
   }
   
   // Initialize SPIFFS
   if (!SPIFFS.begin(true)) {
-    Serial.println("An error occurred while mounting SPIFFS");
+    Console.println("An error occurred while mounting SPIFFS");
     // Error pattern - very fast blink
     ledBlinkInterval = 50;
     return;
   }
-  Serial.println("SPIFFS mounted successfully");
+  Console.println("SPIFFS mounted successfully");
   
   // Configure LEDC channel
   ledcSetup(LEDC_CHANNEL, LEDC_BASE_FREQ, LEDC_TIMER_BIT);
@@ -872,27 +836,22 @@ void setup() {
   // Start control task (cascaded PID) so auto-control actually runs
   controlBegin();
   controlEnable(true); // Enable auto-control by default
-  Serial.println("Control task started");
+  Console.println("Control task started");
   
-  // Initialize MPU6050 sensor
-  mpuInitialized = initMPU6050();
-  if (mpuInitialized) {
-    Serial.println("MPU6050 initialized successfully");
-    // Explicitly reset IMU data to zero
-    resetIMU();
-  } else {
-    Serial.println("MPU6050 initialization failed - continuing without angle measurement");
-  }
+  // Initialize H30 sensor
+  initH30(H30_RX_PIN, H30_TX_PIN, H30_BAUD);
+  Console.println("H30 Serial opened, waiting for data...");
+  // mpuInitialized will be set true in mpuTask when data arrives
 
   // Explicitly reset control state (PIDs, target yaw)
   controlReset();
-  Serial.println("System state reset: Servo centered, IMU zeroed, Control reset.");
+  Console.println("System state reset: Servo centered, IMU zeroed, Control reset.");
   
   // Start the maneuver task
   xTaskCreate(maneuverTask, "ManeuverTask", 4096, NULL, 1, NULL);
   
 #if ENABLE_WIFI
-  Serial.println("WiFi mode enabled");
+  Console.println("WiFi mode enabled");
   
   // Load WiFi configuration
   loadWiFiConfig();
@@ -922,31 +881,31 @@ void setup() {
   
   // Start web server
   server.begin();
-  Serial.println("Web server started");
+  Console.println("Web server started");
   
   if (connected) {
-    Serial.println("System ready in STA mode");
-    Serial.print("Access control panel at: http://");
-    Serial.println(WiFi.localIP());
+    Console.println("System ready in STA mode");
+    Console.print("Access control panel at: http://");
+    Console.println(WiFi.localIP());
   } else {
-    Serial.println("System ready in AP mode");
-    Serial.print("Connect to WiFi network: ");
-    Serial.println(apSSID);
-    Serial.print("Password: ");
-    Serial.println(apPassword);
-    Serial.print("Then navigate to: http://");
-    Serial.println(WiFi.softAPIP());
+    Console.println("System ready in AP mode");
+    Console.print("Connect to WiFi network: ");
+    Console.println(apSSID);
+    Console.print("Password: ");
+    Console.println(apPassword);
+    Console.print("Then navigate to: http://");
+    Console.println(WiFi.softAPIP());
   }
 #else
-  Serial.println("WiFi disabled - Serial-only mode");
-  Serial.println("System ready for serial control");
-  Serial.println("Commands: s<angle> (e.g., s90 to set servo to 90 degrees)");
-  Serial.println("  c0|c1 or c - disable/enable auto-control");
-  Serial.println("  t<angle> - set target yaw (deg, -180..180)");
-  Serial.println("  C - show control status (target, desired_rate, rate_cmd)");
-  Serial.println("  o | o1 | o0 - toggle | enable | disable invert of control output (reverse direction)");
-  Serial.println("  m<deg> - set controller +/- angle limit in degrees (e.g. m25). No arg prints current limit.");
-  Serial.println("  d | d1 | d0 - toggle | enable | disable control debug prints");
+  Console.println("WiFi disabled - Serial-only mode");
+  Console.println("System ready for serial control");
+  Console.println("Commands: s<angle> (e.g., s90 to set servo to 90 degrees)");
+  Console.println("  c0|c1 or c - disable/enable auto-control");
+  Console.println("  t<angle> - set target yaw (deg, -180..180)");
+  Console.println("  C - show control status (target, desired_rate, rate_cmd)");
+  Console.println("  o | o1 | o0 - toggle | enable | disable invert of control output (reverse direction)");
+  Console.println("  m<deg> - set controller +/- angle limit in degrees (e.g. m25). No arg prints current limit.");
+  Console.println("  d | d1 | d0 - toggle | enable | disable control debug prints");
   turnLedOn(); // Solid LED in serial mode
 #endif
   
